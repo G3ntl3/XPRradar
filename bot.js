@@ -288,6 +288,8 @@ bot.command("tokens", async (ctx) => {
   const loading = await ctx.reply("⏳ Loading all tokens…");
   const { tokens, count } = await getAllTokens();
 
+  console.log(`/tokens — fetched ${tokens.length} unique tokens, API count: ${count}`);
+
   if (!tokens.length) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id, "❌ Could not fetch token list.");
     return;

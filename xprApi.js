@@ -5,7 +5,7 @@ const API = "https://indexer.protonnz.com/api";
 async function get(path) {
   try {
     const res = await fetch(`${API}${path}`, {
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(10000),
     });
     if (res.ok) return await res.json();
     console.warn(`API ${path} returned ${res.status}`);
@@ -15,34 +15,20 @@ async function get(path) {
   return null;
 }
 
-// ─── Single token info ────────────────────────────────────────────────────────
+// ─── Single token ─────────────────────────────────────────────────────────────
 
 export async function getToken(symbol) {
   const data = await get(`/tokens?symbol=${symbol.toUpperCase()}`);
   return data?.tokens?.[0] ?? null;
 }
 
-// ─── All tokens — fetches ALL pages ──────────────────────────────────────────
+// ─── All tokens — single request, no pagination needed ───────────────────────
 
 export async function getAllTokens() {
-  let all = [];
-  let offset = 0;
-  const limit = 50;
-
-  while (true) {
-    const data = await get(`/tokens?limit=${limit}&offset=${offset}`);
-    const batch = data?.tokens ?? [];
-    all = all.concat(batch);
-
-    // Stop if we got fewer than limit (last page) or nothing
-    if (batch.length < limit) break;
-    offset += limit;
-
-    // Safety cap at 500 tokens
-    if (all.length >= 500) break;
-  }
-
-  return { tokens: all, count: all.length };
+  // API returns all tokens in one shot (confirmed 268 tokens, no pagination)
+  const data = await get(`/tokens?limit=500`);
+  const tokens = data?.tokens ?? [];
+  return { tokens, count: tokens.length };
 }
 
 // ─── Trades — uses tokenId ────────────────────────────────────────────────────
@@ -61,14 +47,4 @@ export async function getHolders(symbol, limit = 10) {
   if (!token?.tokenId) return [];
   const data = await get(`/tokens/${token.tokenId}/holders?limit=${limit}`);
   return data?.holders ?? (Array.isArray(data) ? data : []);
-}
-
-// ─── Get a single holder's balance from the holders list ─────────────────────
-
-export async function getHolderBalance(symbol, account) {
-  const holders = await getHolders(symbol, 50);
-  const match = holders.find(h =>
-    (h.account ?? "").toLowerCase() === account.toLowerCase()
-  );
-  return match ?? null;
 }
