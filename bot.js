@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard } from "grammy";
 import { getTokenPool, getTokenMetadata, getAllPools, getRecentTrades } from "./xprApi.js";
-
+import "dotenv/config";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "YOUR_BOT_TOKEN_HERE";
 const bot = new Bot(BOT_TOKEN);
 
