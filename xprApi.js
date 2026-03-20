@@ -22,31 +22,53 @@ export async function getToken(symbol) {
   return data?.tokens?.[0] ?? null;
 }
 
-// ─── All tokens (paginated) ───────────────────────────────────────────────────
+// ─── All tokens — fetches ALL pages ──────────────────────────────────────────
 
-export async function getAllTokens(limit = 50, offset = 0) {
-  const data = await get(`/tokens?limit=${limit}&offset=${offset}`);
-  return { tokens: data?.tokens ?? [], count: data?.count ?? 0 };
+export async function getAllTokens() {
+  let all = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const data = await get(`/tokens?limit=${limit}&offset=${offset}`);
+    const batch = data?.tokens ?? [];
+    all = all.concat(batch);
+
+    // Stop if we got fewer than limit (last page) or nothing
+    if (batch.length < limit) break;
+    offset += limit;
+
+    // Safety cap at 500 tokens
+    if (all.length >= 500) break;
+  }
+
+  return { tokens: all, count: all.length };
 }
 
-// ─── Recent trades for a token ────────────────────────────────────────────────
+// ─── Trades — uses tokenId ────────────────────────────────────────────────────
 
 export async function getTrades(symbol, limit = 5) {
-  const data = await get(`/trades?symbol=${symbol.toUpperCase()}&limit=${limit}`);
-  return data?.trades ?? data ?? [];
+  const token = await getToken(symbol);
+  if (!token?.tokenId) return [];
+  const data = await get(`/tokens/${token.tokenId}/trades?limit=${limit}`);
+  return data?.trades ?? (Array.isArray(data) ? data : []);
 }
 
-// ─── Top holders for a token ──────────────────────────────────────────────────
+// ─── Holders — uses tokenId ───────────────────────────────────────────────────
 
-export async function getHolders(symbol, limit = 5) {
-  const data = await get(`/holders?symbol=${symbol.toUpperCase()}&limit=${limit}`);
-  return data?.holders ?? data ?? [];
+export async function getHolders(symbol, limit = 10) {
+  const token = await getToken(symbol);
+  if (!token?.tokenId) return [];
+  const data = await get(`/tokens/${token.tokenId}/holders?limit=${limit}`);
+  return data?.holders ?? (Array.isArray(data) ? data : []);
 }
 
-// ─── Price history ────────────────────────────────────────────────────────────
+// ─── Get a single holder's balance from the holders list ─────────────────────
 
-export async function getHistory(symbol, since = null) {
-  const ts = since ?? Math.floor(Date.now() / 1000) - 86400; // default: last 24h
-  const data = await get(`/history?symbol=${symbol.toUpperCase()}&since=${ts}`);
-  return data ?? [];
+export async function getHolderBalance(symbol, account) {
+  const holders = await getHolders(symbol, 50);
+  const match = holders.find(h =>
+    (h.account ?? "").toLowerCase() === account.toLowerCase()
+  );
+  return match ?? null;
 }

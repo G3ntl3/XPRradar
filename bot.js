@@ -95,6 +95,61 @@ bot.command("help", async (ctx) => {
   );
 });
 
+// ─── Shared: build token message ─────────────────────────────────────────────
+// Extracted so both /token command AND refresh callback use identical output
+
+async function buildTokenMsg(symbol) {
+  const t = await getToken(symbol);
+  if (!t) return null;
+
+  let msg = "";
+  msg += `🪙 <b>${t.name}</b> (<code>${t.symbol}</code>)\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  msg += `💰 <b>Price:</b> <code>${fmtPrice(t.price)}</code>\n`;
+  msg += `🏷 <b>Status:</b> ${bondStatus(t)}\n\n`;
+  msg += `📊 <b>Market</b>\n`;
+  msg += `   MCap:    <code>$${fmtNum(t.mcap)}</code>\n`;
+  msg += `   24h Vol: <code>$${fmtNum(t.volume24h)}</code>\n`;
+  msg += `   24h:     ${fmtChange(t.change24h)}\n`;
+  msg += `   7d:      ${fmtChange(t.change7d)}\n`;
+  msg += `   High24h: <code>${fmtPrice(t.high24h)}</code>\n`;
+  msg += `   Low24h:  <code>${fmtPrice(t.low24h)}</code>\n\n`;
+  msg += `🏭 <b>Supply</b>\n`;
+  msg += `   Circulating: <code>${fmtNum(t.circulatingSupply)}</code>\n`;
+  msg += `   Total:       <code>${fmtNum(t.supply)}</code>\n`;
+  msg += `   Max:         <code>${fmtNum(t.maxSupply)}</code>\n`;
+  if (t.burned) msg += `   Burned:      <code>${fmtNum(t.burned)}</code> 🔥\n`;
+  msg += `\n`;
+  msg += `📈 <b>Activity (24h)</b>\n`;
+  msg += `   Buys:    ${t.buys24h ?? "—"}\n`;
+  msg += `   Sells:   ${t.sells24h ?? "—"}\n`;
+  msg += `   Traders: ${t.uniqueTraders24h ?? "—"} unique\n`;
+  msg += `   All-time traders: ${t.uniqueTradersAllTime ?? "—"}\n\n`;
+  if (t.ath) {
+    msg += `🏆 <b>ATH:</b> <code>${fmtPrice(t.ath)}</code>`;
+    if (t.athTimestamp) msg += ` (${fmtDate(t.athTimestamp)})`;
+    msg += `\n`;
+  }
+  if (t.creator)     msg += `👤 <b>Creator:</b> <code>${t.creator}</code>\n`;
+  if (t.firstTradeAt) msg += `📅 <b>Launched:</b> ${fmtDate(t.firstTradeAt)}\n`;
+  if (t.description) {
+    const shortDesc = t.description.length > 120
+      ? t.description.slice(0, 120) + "…"
+      : t.description;
+    msg += `\n📝 <i>${shortDesc}</i>\n`;
+  }
+  msg += `\n<i>Source: dex.protonnz.com</i>`;
+
+  const kb = new InlineKeyboard()
+    .text("🔄 Refresh",  `token:${symbol}`)
+    .text("🔄 Trades",   `trades:${symbol}`)
+    .row()
+    .text("👥 Holders",  `holders:${symbol}`)
+    .text("🕵️ Dev Check", `devcheck:${symbol}`);
+
+  return { msg, kb, token: t };
+}
+
 // ─── /token — Full metadata ───────────────────────────────────────────────────
 
 bot.command("token", async (ctx) => {
@@ -104,9 +159,9 @@ bot.command("token", async (ctx) => {
   const loading = await ctx.reply(`⏳ Fetching <b>${symbol}</b>…`, { parse_mode: "HTML" });
 
   try {
-    const t = await getToken(symbol);
+    const result = await buildTokenMsg(symbol);
 
-    if (!t) {
+    if (!result) {
       await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
         `❌ <b>${symbol}</b> not found on SimpleDEX.\n\nUse /tokens to browse all tokens.`,
         { parse_mode: "HTML" }
@@ -115,70 +170,11 @@ bot.command("token", async (ctx) => {
     }
 
     // Auto-save price snapshot for /pnl tracking
-    saveSnapshot(ctx.from.id, symbol, t.price);
+    saveSnapshot(ctx.from.id, symbol, result.token.price);
 
-    let msg = "";
-    msg += `🪙 <b>${t.name}</b> (<code>${t.symbol}</code>)\n`;
-    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-    // Price & status
-    msg += `💰 <b>Price:</b> <code>${fmtPrice(t.price)}</code>\n`;
-    msg += `🏷 <b>Status:</b> ${bondStatus(t)}\n\n`;
-
-    // Market stats
-    msg += `📊 <b>Market</b>\n`;
-    msg += `   MCap:    <code>$${fmtNum(t.mcap)}</code>\n`;
-    msg += `   24h Vol: <code>$${fmtNum(t.volume24h)}</code>\n`;
-    msg += `   24h:     ${fmtChange(t.change24h)}\n`;
-    msg += `   7d:      ${fmtChange(t.change7d)}\n`;
-    msg += `   High24h: <code>${fmtPrice(t.high24h)}</code>\n`;
-    msg += `   Low24h:  <code>${fmtPrice(t.low24h)}</code>\n\n`;
-
-    // Supply
-    msg += `🏭 <b>Supply</b>\n`;
-    msg += `   Circulating: <code>${fmtNum(t.circulatingSupply)}</code>\n`;
-    msg += `   Total:       <code>${fmtNum(t.supply)}</code>\n`;
-    msg += `   Max:         <code>${fmtNum(t.maxSupply)}</code>\n`;
-    if (t.burned) msg += `   Burned:      <code>${fmtNum(t.burned)}</code> 🔥\n`;
-    msg += `\n`;
-
-    // Trading activity
-    msg += `📈 <b>Activity (24h)</b>\n`;
-    msg += `   Buys:    ${t.buys24h ?? "—"}\n`;
-    msg += `   Sells:   ${t.sells24h ?? "—"}\n`;
-    msg += `   Traders: ${t.uniqueTraders24h ?? "—"} unique\n`;
-    msg += `   All-time traders: ${t.uniqueTradersAllTime ?? "—"}\n\n`;
-
-    // ATH
-    if (t.ath) {
-      msg += `🏆 <b>ATH:</b> <code>${fmtPrice(t.ath)}</code>`;
-      if (t.athTimestamp) msg += ` (${fmtDate(t.athTimestamp)})`;
-      msg += `\n`;
-    }
-
-    // Creator & age
-    if (t.creator) msg += `👤 <b>Creator:</b> <code>${t.creator}</code>\n`;
-    if (t.firstTradeAt) msg += `📅 <b>Launched:</b> ${fmtDate(t.firstTradeAt)}\n`;
-
-    // Description
-    if (t.description) {
-      const shortDesc = t.description.length > 120
-        ? t.description.slice(0, 120) + "…"
-        : t.description;
-      msg += `\n📝 <i>${shortDesc}</i>\n`;
-    }
-
-    msg += `\n<i>Source: dex.protonnz.com</i>`;
-
-    const kb = new InlineKeyboard()
-      .text("🔄 Refresh",   `token:${symbol}`)
-      .text("🔄 Trades",    `trades:${symbol}`)
-      .row()
-      .text("👥 Holders",   `holders:${symbol}`);
-
-    await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, {
+    await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, {
       parse_mode: "HTML",
-      reply_markup: kb,
+      reply_markup: result.kb,
     });
 
   } catch (e) {
@@ -272,12 +268,13 @@ bot.command("holders", async (ctx) => {
 
   let msg = `👥 <b>${symbol} Top Holders</b>\n\n`;
   holders.forEach((h, i) => {
-    const account = h.account ?? h.holder ?? "unknown";
-    const balance = h.balance ?? h.amount ?? 0;
-    const pct     = h.percentage ?? h.pct ?? null;
+    const account    = h.account ?? "unknown";
+    const walletAmt  = parseFloat(h.walletAmount ?? h.amount ?? 0);
+    const lpAmt      = parseFloat(h.lpAmount ?? 0);
+    const total      = walletAmt + lpAmt;
     msg += `${i + 1}. <code>${account}</code>\n`;
-    msg += `   ${fmtNum(balance)} ${symbol}`;
-    if (pct) msg += `  (${pct.toFixed(2)}%)`;
+    msg += `   💼 ${fmtNum(walletAmt)} ${symbol}`;
+    if (lpAmt > 0) msg += `  🏦 LP: ${fmtNum(lpAmt)}`;
     msg += `\n\n`;
   });
   msg += `<i>Source: dex.protonnz.com</i>`;
@@ -288,23 +285,42 @@ bot.command("holders", async (ctx) => {
 // ─── /tokens ──────────────────────────────────────────────────────────────────
 
 bot.command("tokens", async (ctx) => {
-  const loading = await ctx.reply("⏳ Loading tokens…");
-  const { tokens, count } = await getAllTokens(30);
+  const loading = await ctx.reply("⏳ Loading all tokens…");
+  const { tokens, count } = await getAllTokens();
 
   if (!tokens.length) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id, "❌ Could not fetch token list.");
     return;
   }
 
-  let msg = `🪙 <b>SimpleDEX Tokens</b> (${count} total)\n\n`;
-  for (const t of tokens) {
-    const status = t.graduated ? "🎓" : "📈";
-    msg += `${status} <b>${t.symbol}</b> — ${fmtPrice(t.price)}`;
-    msg += ` · MCap $${fmtNum(t.mcap)}\n`;
+  // Telegram messages max 4096 chars — split into pages of 50
+  const PAGE = 50;
+  const pages = [];
+  for (let i = 0; i < tokens.length; i += PAGE) {
+    pages.push(tokens.slice(i, i + PAGE));
   }
-  msg += `\n<i>Use /token SYMBOL for full details</i>`;
 
-  await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, { parse_mode: "HTML" });
+  // Send first page as edit of loading message
+  const buildPage = (page, pageNum, total) => {
+    let msg = `🪙 <b>SimpleDEX Tokens</b> (${total} total) — Page ${pageNum}/${pages.length}\n\n`;
+    for (const t of page) {
+      const status = t.graduated ? "🎓" : "📈";
+      msg += `${status} <b>${t.symbol}</b> — ${fmtPrice(t.price)} · $${fmtNum(t.mcap)}\n`;
+    }
+    msg += `\n<i>Use /token SYMBOL for full details</i>`;
+    return msg;
+  };
+
+  await ctx.api.editMessageText(
+    ctx.chat.id, loading.message_id,
+    buildPage(pages[0], 1, count),
+    { parse_mode: "HTML" }
+  );
+
+  // Send remaining pages as new messages
+  for (let i = 1; i < pages.length; i++) {
+    await ctx.reply(buildPage(pages[i], i + 1, count), { parse_mode: "HTML" });
+  }
 });
 
 // ─── /pnl ─────────────────────────────────────────────────────────────────────
@@ -418,97 +434,18 @@ bot.command("devcheck", async (ctx) => {
   );
 
   try {
-    const r = await runDevCheck(symbol);
+    const result = await buildDevCheckMsg(symbol);
 
-    if (r.error) {
+    if (result.error) {
       await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-        `❌ ${r.error}`, { parse_mode: "HTML" }
+        `❌ ${result.error}`, { parse_mode: "HTML" }
       );
       return;
     }
 
-    let msg = "";
-
-    // Header
-    msg += `🕵️ <b>Dev Check — ${r.tokenName} (${r.symbol})</b>\n`;
-    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-    // Dev identity
-    msg += `👤 <b>Creator:</b> <code>${r.creator}</code>\n\n`;
-
-    // Current holdings
-    msg += `💼 <b>Current Holdings</b>\n`;
-    if (r.currentBalance > 0) {
-      msg += `   Balance: <code>${fmtNum(r.currentBalance)} ${r.symbol}</code>\n`;
-      msg += `   Share:   <code>${r.holdingPct.toFixed(2)}%</code> of supply\n`;
-      msg += `   Value:   <code>~$${fmtNum(r.valueUsd)}</code>\n`;
-      msg += `   Status:  ${r.currentBalance > 0 ? "🟢 Still Holding" : "🔴 Fully Exited"}\n\n`;
-    } else {
-      msg += `   Balance: <code>0 ${r.symbol}</code>\n`;
-      msg += `   Status:  🔴 Dev holds nothing\n\n`;
-    }
-
-    // Sell activity
-    msg += `📤 <b>Sell Activity</b>\n`;
-    if (r.totalSold > 0) {
-      const soldPct = r.totalSupply > 0 ? (r.totalSold / r.totalSupply * 100).toFixed(2) : "?";
-      msg += `   Total Sold: <code>${fmtNum(r.totalSold)} ${r.symbol}</code> (${soldPct}%)\n`;
-      msg += `   Sell Txns:  ${r.sellCount}\n`;
-      if (r.lastSell?.timestamp) {
-        const ts = new Date(r.lastSell.timestamp * 1000).toISOString().slice(0, 16).replace("T", " ");
-        msg += `   Last Sell:  ${ts} UTC\n`;
-      }
-    } else {
-      msg += `   Total Sold: 0 — never sold ✅\n`;
-    }
-    msg += `\n`;
-
-    // Wallet transfers
-    if (r.suspiciousTransfers.length > 0) {
-      msg += `🔀 <b>Token Transfers to Other Wallets</b>\n`;
-      for (const w of r.suspiciousTransfers.slice(0, 5)) {
-        const freshTag = w.isFresh ? " ⚠️ <i>fresh wallet</i>" : "";
-        msg += `   → <code>${w.to}</code>${freshTag}\n`;
-        msg += `      ${fmtNum(w.amount)} ${r.symbol}\n`;
-      }
-      msg += `\n`;
-    } else {
-      msg += `🔀 <b>Wallet Transfers:</b> None detected ✅\n\n`;
-    }
-
-    // Flags
-    if (r.flags.length > 0) {
-      msg += `⚠️ <b>Risk Flags</b>\n`;
-      for (const f of r.flags) msg += `   ${f}\n`;
-      msg += `\n`;
-    }
-
-    // Positive signals
-    if (r.positive.length > 0) {
-      msg += `✅ <b>Positive Signals</b>\n`;
-      for (const p of r.positive) msg += `   ${p}\n`;
-      msg += `\n`;
-    }
-
-    // Risk score
-    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `${r.riskEmoji} <b>Risk Score: ${r.riskScore}/10 — ${r.riskLabel}</b>\n`;
-
-    // Score bar
-    const filled = "█".repeat(r.riskScore);
-    const empty  = "░".repeat(10 - r.riskScore);
-    msg += `<code>${filled}${empty}</code>\n\n`;
-
-    msg += `<i>⚠️ Always DYOR. This is not financial advice.</i>\n`;
-    msg += `<i>Source: dex.protonnz.com · XPR Network</i>`;
-
-    const kb = new InlineKeyboard()
-      .text("🔄 Refresh",    `devcheck:${symbol}`)
-      .text("📋 Token Info", `token:${symbol}`);
-
-    await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, {
+    await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, {
       parse_mode: "HTML",
-      reply_markup: kb,
+      reply_markup: result.kb,
     });
 
   } catch (e) {
@@ -519,6 +456,79 @@ bot.command("devcheck", async (ctx) => {
   }
 });
 
+// ─── buildDevCheckMsg helper (used by command + refresh button) ───────────────
+
+async function buildDevCheckMsg(symbol) {
+  const r = await runDevCheck(symbol);
+  if (r.error) return { error: r.error };
+
+  let msg = "";
+  msg += `🕵️ <b>Dev Check — ${r.tokenName} (${r.symbol})</b>\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  msg += `👤 <b>Creator:</b> <code>${r.creator}</code>\n\n`;
+
+  msg += `💼 <b>Current Holdings</b>\n`;
+  if (r.currentBalance > 0) {
+    msg += `   Balance: <code>${fmtNum(r.currentBalance)} ${r.symbol}</code>\n`;
+    msg += `   Share:   <code>${r.holdingPct.toFixed(2)}%</code> of supply\n`;
+    msg += `   Value:   <code>~$${fmtNum(r.valueUsd)}</code>\n`;
+    msg += `   Status:  🟢 Still Holding\n\n`;
+  } else {
+    msg += `   Balance: <code>0 ${r.symbol}</code>\n`;
+    msg += `   Status:  🔴 Dev holds nothing\n\n`;
+  }
+
+  msg += `📤 <b>Sell Activity</b>\n`;
+  if (r.totalSold > 0) {
+    const soldPct = r.totalSupply > 0 ? (r.totalSold / r.totalSupply * 100).toFixed(2) : "?";
+    msg += `   Total Sold: <code>${fmtNum(r.totalSold)} ${r.symbol}</code> (${soldPct}%)\n`;
+    msg += `   Sell Txns:  ${r.sellCount}\n`;
+    if (r.lastSell?.timestamp) {
+      const ts = new Date(r.lastSell.timestamp * 1000).toISOString().slice(0, 16).replace("T", " ");
+      msg += `   Last Sell:  ${ts} UTC\n`;
+    }
+  } else {
+    msg += `   Total Sold: 0 — never sold ✅\n`;
+  }
+  msg += `\n`;
+
+  if (r.suspiciousTransfers.length > 0) {
+    msg += `🔀 <b>Token Transfers to Other Wallets</b>\n`;
+    for (const w of r.suspiciousTransfers.slice(0, 5)) {
+      const freshTag = w.isFresh ? " ⚠️ <i>fresh wallet</i>" : "";
+      msg += `   → <code>${w.to}</code>${freshTag}\n`;
+      msg += `      ${fmtNum(w.amount)} ${r.symbol}\n`;
+    }
+    msg += `\n`;
+  } else {
+    msg += `🔀 <b>Wallet Transfers:</b> None detected ✅\n\n`;
+  }
+
+  if (r.flags.length > 0) {
+    msg += `⚠️ <b>Risk Flags</b>\n`;
+    for (const f of r.flags) msg += `   ${f}\n`;
+    msg += `\n`;
+  }
+
+  if (r.positive.length > 0) {
+    msg += `✅ <b>Positive Signals</b>\n`;
+    for (const p of r.positive) msg += `   ${p}\n`;
+    msg += `\n`;
+  }
+
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `${r.riskEmoji} <b>Risk Score: ${r.riskScore}/10 — ${r.riskLabel}</b>\n`;
+  msg += `<code>${"█".repeat(r.riskScore)}${"░".repeat(10 - r.riskScore)}</code>\n\n`;
+  msg += `<i>⚠️ Always DYOR. This is not financial advice.</i>\n`;
+  msg += `<i>Source: dex.protonnz.com · XPR Network</i>`;
+
+  const kb = new InlineKeyboard()
+    .text("🔄 Refresh",    `devcheck:${symbol}`)
+    .text("📋 Token Info", `token:${symbol}`);
+
+  return { msg, kb };
+}
+
 // ─── Inline callbacks ─────────────────────────────────────────────────────────
 
 bot.on("callback_query:data", async (ctx) => {
@@ -526,15 +536,19 @@ bot.on("callback_query:data", async (ctx) => {
   const [action, symbol] = ctx.callbackQuery.data.split(":");
 
   if (action === "token") {
-    ctx.match = symbol;
-    await bot.handleUpdate({ ...ctx.update,
-      callback_query: undefined,
-      message: { ...ctx.callbackQuery.message, text: `/token ${symbol}`, reply_to_message: undefined }
-    });
+    // Refresh token message in place
+    const result = await buildTokenMsg(symbol);
+    if (!result) return ctx.answerCallbackQuery("Token not found");
+    saveSnapshot(ctx.from.id, symbol, result.token.price);
+    await ctx.editMessageText(result.msg, {
+      parse_mode: "HTML",
+      reply_markup: result.kb,
+    }).catch(() => ctx.reply(result.msg, { parse_mode: "HTML", reply_markup: result.kb }));
 
   } else if (action === "price") {
     const t = await getToken(symbol);
     if (!t) return ctx.answerCallbackQuery("No data found");
+    saveSnapshot(ctx.from.id, symbol, t.price);
     const kb = new InlineKeyboard()
       .text("📋 Full Info", `token:${symbol}`)
       .text("🔄 Refresh",   `price:${symbol}`);
@@ -546,11 +560,11 @@ bot.on("callback_query:data", async (ctx) => {
       `Status: ${bondStatus(t)}\n\n` +
       `<i>dex.protonnz.com</i>`,
       { parse_mode: "HTML", reply_markup: kb }
-    );
+    ).catch(() => {});
 
   } else if (action === "trades") {
     const trades = await getTrades(symbol, 5);
-    if (!trades.length) return ctx.reply(`No recent trades for ${symbol}`);
+    if (!trades.length) return ctx.reply(`❌ No recent trades for <b>${symbol}</b>`, { parse_mode: "HTML" });
     let msg = `🔄 <b>Recent ${symbol} Trades</b>\n\n`;
     for (const t of trades) {
       const type = t.type === "buy" ? "🟢 BUY " : "🔴 SELL";
@@ -562,30 +576,31 @@ bot.on("callback_query:data", async (ctx) => {
 
   } else if (action === "holders") {
     const holders = await getHolders(symbol, 10);
-    if (!holders.length) return ctx.reply(`No holder data for ${symbol}`);
+    if (!holders.length) return ctx.reply(`❌ No holder data found for <b>${symbol}</b>.`, { parse_mode: "HTML" });
     let msg = `👥 <b>${symbol} Top Holders</b>\n\n`;
     holders.forEach((h, i) => {
-      msg += `${i + 1}. <code>${h.account ?? "unknown"}</code> — ${fmtNum(h.balance ?? 0)}\n`;
+      const amt = fmtNum(h.walletAmount ?? h.amount ?? 0);
+      const pct = h.percentage ? ` (${parseFloat(h.percentage).toFixed(2)}%)` : "";
+      msg += `${i + 1}. <code>${h.account ?? "unknown"}</code>\n`;
+      msg += `   ${amt} ${symbol}${pct}\n\n`;
     });
+    msg += `<i>Source: dex.protonnz.com</i>`;
     await ctx.reply(msg, { parse_mode: "HTML" });
 
   } else if (action === "devcheck") {
-    await ctx.reply(`⏳ Re-running dev check for <b>${symbol}</b>…`, { parse_mode: "HTML" });
-    const r = await runDevCheck(symbol);
-    if (r.error) return ctx.reply(`❌ ${r.error}`);
-
-    let msg = `🕵️ <b>Dev Check — ${r.tokenName} (${r.symbol})</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    msg += `👤 <b>Creator:</b> <code>${r.creator}</code>\n\n`;
-    msg += `💼 Balance: <code>${fmtNum(r.currentBalance)} ${r.symbol}</code> (${r.holdingPct.toFixed(2)}%)\n`;
-    msg += `📤 Sold: ${r.totalSold > 0 ? fmtNum(r.totalSold) + " " + r.symbol : "Nothing ✅"}\n`;
-    msg += `🔀 Wallet transfers: ${r.suspiciousTransfers.length}\n\n`;
-    msg += `${r.riskEmoji} <b>Risk: ${r.riskScore}/10 — ${r.riskLabel}</b>\n`;
-    msg += `<code>${"█".repeat(r.riskScore)}${"░".repeat(10 - r.riskScore)}</code>`;
-
-    const kb = new InlineKeyboard()
-      .text("🔄 Refresh",    `devcheck:${symbol}`)
-      .text("📋 Token Info", `token:${symbol}`);
-    await ctx.reply(msg, { parse_mode: "HTML", reply_markup: kb });
+    // Use editMessageText to refresh in place
+    await ctx.editMessageText(
+      `⏳ Refreshing dev check for <b>${symbol}</b>…`, { parse_mode: "HTML" }
+    ).catch(() => {});
+    const result = await buildDevCheckMsg(symbol);
+    if (result.error) {
+      await ctx.editMessageText(`❌ ${result.error}`).catch(() => {});
+      return;
+    }
+    await ctx.editMessageText(result.msg, {
+      parse_mode: "HTML",
+      reply_markup: result.kb,
+    }).catch(() => ctx.reply(result.msg, { parse_mode: "HTML", reply_markup: result.kb }));
   }
 });
 
