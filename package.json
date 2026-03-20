@@ -1,0 +1,12 @@
+{
+  "name": "simpledex-info-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "grammy": "^1.41.1",
+    "node-fetch": "^3.3.2"
+  }
+}
