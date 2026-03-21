@@ -18,39 +18,34 @@ function timeSince(ts) {
 }
 
 function fmtMcap(n) {
-  if (!n) return "$0";
+  if (!n || n <= 0) return "—";
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`;
   return `$${n.toFixed(2)}`;
 }
 
-// Blend a solid colour rectangle over background pixels
 function blendRect(img, x, y, w, h, r, g, b, alpha) {
   const a = alpha / 255;
   const ia = 1 - a;
   for (let px = x; px < Math.min(x + w, img.bitmap.width); px++) {
     for (let py = y; py < Math.min(y + h, img.bitmap.height); py++) {
       const c = Jimp.intToRGBA(img.getPixelColor(px, py));
-      img.setPixelColor(
-        Jimp.rgbaToInt(
-          Math.round(r * a + c.r * ia),
-          Math.round(g * a + c.g * ia),
-          Math.round(b * a + c.b * ia),
-          255
-        ), px, py
-      );
+      img.setPixelColor(Jimp.rgbaToInt(
+        Math.round(r * a + c.r * ia),
+        Math.round(g * a + c.g * ia),
+        Math.round(b * a + c.b * ia),
+        255
+      ), px, py);
     }
   }
 }
 
 export async function generatePnlCard({
-  symbol, tokenName, mcapThen, mcapNow,
-  pctChange, xChange, snapTimestamp,
+  symbol, tokenName, mcapThen, mcapNow, pctChange, xChange, snapTimestamp,
 }) {
-  const isUp = (mcapNow ?? 0) >= (mcapThen ?? 0);
+  const isUp = pctChange >= 0;
   const W = 900, H = 470;
 
-  // ── Load + resize background ──────────────────────────────────────────────
   let img;
   try {
     img = await Jimp.read(BG_PATH);
@@ -59,45 +54,41 @@ export async function generatePnlCard({
     img = new Jimp(W, H, 0x0d001aff);
   }
 
-  // ── Subtle dark gradient on right half only — background still visible ────
-  // Light darkening so purple stars still show through
   blendRect(img, 360, 0, W - 360, H, 0, 0, 10, 140);
-
-  // Soft fade at the left edge of dark zone
   for (let x = 340; x < 360; x++) {
-    const t = (x - 340) / 20;
-    blendRect(img, x, 0, 1, H, 0, 0, 10, Math.round(t * 140));
+    blendRect(img, x, 0, 1, H, 0, 0, 10, Math.round(((x - 340) / 20) * 140));
   }
 
-  // ── Fonts ─────────────────────────────────────────────────────────────────
   const f64 = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
   const f32 = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
   const f16 = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
 
   const PX = 390;
 
-  // ── Token symbol ──────────────────────────────────────────────────────────
+  // Token symbol + name
   img.print(f64, PX, 30, symbol);
   img.print(f16, PX, 104, tokenName);
 
-  // Thin white divider
+  // Divider
   blendRect(img, PX, 132, W - PX - 30, 1, 255, 255, 255, 100);
 
-  // Called at price
-img.print(f16, PX, 145, `mcap   ${fmtMcap(priceNow)}`);
-  const xText = `${sign}${xChange.toFixed(2)}X`;
+  // called at mcap — uses mcapThen
+  img.print(f16, PX, 145, `called at   ${fmtMcap(mcapThen)} mcap`);
 
-  // Solid green or red pill — fully opaque so it pops off background
-  blendRect(img, PX - 5, 182, W - PX - 25, 105, isUp ? 22 : 200, isUp ? 195 : 20, isUp ? 22 : 45, 255);
+  // Giant X pill
+  const sign  = isUp ? "+" : "";
+  const xText = `${sign}${xChange.toFixed(2)}X`;
+  blendRect(img, PX - 5, 182, W - PX - 25, 105,
+    isUp ? 22 : 200, isUp ? 195 : 20, isUp ? 22 : 45, 255);
   img.print(f64, PX + 10, 197, xText);
 
-  // ── % change ─────────────────────────────────────────────────────────────
+  // % change
   img.print(f32, PX, 305, `${sign}${pctChange.toFixed(2)}%`);
 
   // Divider
   blendRect(img, PX, 362, W - PX - 30, 1, 255, 255, 255, 100);
 
-  // ── Bottom: time + watermark ──────────────────────────────────────────────
+  // Bottom row
   img.print(f16, PX,       378, timeSince(snapTimestamp));
   img.print(f16, PX + 180, 378, `$${symbol}   XPR Radar Bot`);
   img.print(f16, PX,       406, `dex.protonnz.com`);

@@ -9,6 +9,7 @@ import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSu
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN in .env");
 
+
 const bot = new Bot(BOT_TOKEN);
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
@@ -86,10 +87,12 @@ async function bondingBar(token) {
         const empty  = 20 - filled;
         const bar    = "█".repeat(filled) + "░".repeat(empty);
         const label  = pct >= 75 ? "🔥" : pct >= 50 ? "📈" : pct >= 25 ? "⚡" : "🌱";
-        const xprFmt = bp.realXpr >= 1_000_000
-          ? (bp.realXpr / 1_000_000).toFixed(1) + "M"
-          : (bp.realXpr / 1_000).toFixed(0) + "K";
-        const tgtFmt = (bp.threshold / 1_000_000).toFixed(0) + "M";
+        const xprFmt = bp.realXpr >= 1000
+          ? (bp.realXpr / 1000).toFixed(1) + "K"
+          : bp.realXpr.toFixed(1);
+        const tgtFmt = bp.threshold >= 1000
+          ? (bp.threshold / 1000).toFixed(0) + "K"
+          : bp.threshold.toFixed(0);
         return (
           `${label} <b>Bonding Progress</b>\n` +
           `   <code>${bar}</code> ${pct.toFixed(1)}%\n` +
@@ -437,12 +440,17 @@ bot.command("pnl", async (ctx) => {
     return;
   }
 
-  // Use mcap for PNL — more meaningful than raw price
-const mcapThen = t.mcap ?? 0;const mcapNow  = t.mcap ?? t.price;
-const priceThen = mcapThen;
-const priceNow  = mcapNow;
-const pctChange = mcapThen > 0.001 ? ((mcapNow - mcapThen) / mcapThen) * 100 : 0;
-const xChange   = mcapThen > 0.001 ? mcapNow / mcapThen : 1;
+  // mcapThen: what was stored at snapshot time
+  // If old snapshot stored price (tiny number < 1), use current mcap as fallback
+  const storedVal = snap.price ?? 0;
+  const mcapNow   = t.mcap ?? 0;
+  const mcapThen  = storedVal > 1 ? storedVal : mcapNow; // old price snapshots get current mcap
+
+  const pctChange = mcapThen > 0 ? ((mcapNow - mcapThen) / mcapThen) * 100 : 0;
+  const xChange   = mcapThen > 0 ? mcapNow / mcapThen : 1;
+  // Keep priceThen/priceNow for text fallback
+  const priceThen = mcapThen;
+  const priceNow  = mcapNow;
 
   const kb = new InlineKeyboard()
     .text("🔄 Update Snapshot", `price:${symbol}`)
@@ -456,8 +464,8 @@ const xChange   = mcapThen > 0.001 ? mcapNow / mcapThen : 1;
     const imageBuffer = await generatePnlCard({
       symbol,
       tokenName:     t.name,
-      priceThen:     mcapThen,   // mcap when first checked
-      priceNow:      mcapNow,    // mcap now
+      mcapThen,
+      mcapNow,
       pctChange,
       xChange,
       snapTimestamp: snap.timestamp,

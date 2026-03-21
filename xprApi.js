@@ -80,12 +80,13 @@ async function getBondingThreshold() {
     table: "config",
     limit: 1,
   });
-  _threshold = data?.rows?.[0]?.threshold ?? 500_000_000;
+  // threshold is stored as integer with 4 decimal places (e.g. 500000000 = 50000.0000 XPR)
+  const raw = data?.rows?.[0]?.threshold ?? 500_000_000;
+  _threshold = raw / 10000;  // → 50000.0000 XPR
   return _threshold;
 }
 
 export async function getBondingProgress(tokenId) {
-  // Fetch the token's row from the on-chain table using tokenId as key
   const [tokenData, threshold] = await Promise.all([
     nodePost({
       code: "simplelaunch",
@@ -101,9 +102,10 @@ export async function getBondingProgress(tokenId) {
   const row = tokenData?.rows?.[0];
   if (!row) return null;
 
-  const realXpr     = parseFloat(row.realXpr ?? 0);
-  const graduated   = row.graduated === 1 || row.graduated === true;
-  const pct         = Math.min((realXpr / threshold) * 100, 100);
+  // realXpr is also stored as integer with 4 decimal places
+  const realXpr   = parseFloat(row.realXpr ?? 0) / 10000;
+  const graduated = row.graduated === 1 || row.graduated === true;
+  const pct       = Math.min((realXpr / threshold) * 100, 100);
 
   return { realXpr, threshold, pct, graduated };
 }
