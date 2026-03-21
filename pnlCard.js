@@ -1,10 +1,3 @@
-/**
- * PNL Card Generator — pure JS, no native dependencies
- * Uses jimp for image manipulation + @jimp/plugin-print for text
- *
- * Install: npm install jimp
- */
-
 import Jimp from "jimp";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -12,120 +5,103 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BG_PATH   = path.join(__dirname, "pnl_bg.png");
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function fmtPrice(n) {
-  if (!n) return "$0";
-  if (n >= 1)      return `$${n.toFixed(4)}`;
-  if (n >= 0.0001) return `$${n.toFixed(6)}`;
-  return `$${n.toFixed(10)}`;
-}
-
 function timeSince(ts) {
   const secs = Math.floor(Date.now() / 1000) - ts;
-  if (secs < 60)    return `${secs}s ago`;
-  if (secs < 3600)  return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
+  if (secs < 60)    return `${secs}s`;
+  if (secs < 3600)  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  if (secs < 86400) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return `${h}h ${m}m`;
+  }
+  return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
 }
 
-// Hex colour to Jimp int
-function hex(h) {
-  const r = parseInt(h.slice(1,3), 16);
-  const g = parseInt(h.slice(3,5), 16);
-  const b = parseInt(h.slice(5,7), 16);
-  return Jimp.rgbaToInt(r, g, b, 255);
+function fmtMcap(n) {
+  if (!n) return "$0";
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(2)}`;
 }
 
-// Draw a filled rectangle
-function fillRect(img, x, y, w, h, colour) {
-  for (let dx = 0; dx < w; dx++) {
-    for (let dy = 0; dy < h; dy++) {
-      img.setPixelColor(colour, x + dx, y + dy);
+// Blend a solid colour rectangle over background pixels
+function blendRect(img, x, y, w, h, r, g, b, alpha) {
+  const a = alpha / 255;
+  const ia = 1 - a;
+  for (let px = x; px < Math.min(x + w, img.bitmap.width); px++) {
+    for (let py = y; py < Math.min(y + h, img.bitmap.height); py++) {
+      const c = Jimp.intToRGBA(img.getPixelColor(px, py));
+      img.setPixelColor(
+        Jimp.rgbaToInt(
+          Math.round(r * a + c.r * ia),
+          Math.round(g * a + c.g * ia),
+          Math.round(b * a + c.b * ia),
+          255
+        ), px, py
+      );
     }
   }
 }
 
-// Draw a horizontal line
-function hLine(img, x, y, w, colour) {
-  fillRect(img, x, y, w, 1, colour);
-}
-
-// ─── Main card generator ──────────────────────────────────────────────────────
-
 export async function generatePnlCard({
-  symbol,
-  tokenName,
-  priceThen,
-  priceNow,
-  pctChange,
-  xChange,
-  snapTimestamp,
+  symbol, tokenName, mcapThen, mcapNow,
+  pctChange, xChange, snapTimestamp,
 }) {
-  const isUp = pctChange >= 0;
+  const isUp = (mcapNow ?? 0) >= (mcapThen ?? 0);
+  const W = 900, H = 470;
 
-  // Load background — resize to 800x400 (safe for Telegram's 10MB limit)
+  // ── Load + resize background ──────────────────────────────────────────────
   let img;
   try {
     img = await Jimp.read(BG_PATH);
-    img.resize(800, 400);
+    img.resize(W, H);
   } catch {
-    img = new Jimp(800, 400, 0x1a0033ff);
+    img = new Jimp(W, H, 0x0d001aff);
   }
 
-  // Dark overlay on right half for readability
-  const overlayColour = Jimp.rgbaToInt(0, 0, 0, 170);
-  fillRect(img, 310, 0, 490, 400, overlayColour);
+  // ── Subtle dark gradient on right half only — background still visible ────
+  // Light darkening so purple stars still show through
+  blendRect(img, 360, 0, W - 360, H, 0, 0, 10, 140);
 
-  for (let x = 275; x < 310; x++) {
-    const alpha = Math.round(((x - 275) / 35) * 170);
-    fillRect(img, x, 0, 1, 400, Jimp.rgbaToInt(0, 0, 0, alpha));
+  // Soft fade at the left edge of dark zone
+  for (let x = 340; x < 360; x++) {
+    const t = (x - 340) / 20;
+    blendRect(img, x, 0, 1, H, 0, 0, 10, Math.round(t * 140));
   }
 
-  const fontLarge = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
-  const fontMed   = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+  // ── Fonts ─────────────────────────────────────────────────────────────────
+  const f64 = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
+  const f32 = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+  const f16 = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
 
-  const PX = 325;
+  const PX = 390;
 
-  // Token name
-  img.print(fontLarge, PX, 30, tokenName);
-  img.print(fontMed,   PX, 72, `$${symbol}  ·  XPR Network`);
+  // ── Token symbol ──────────────────────────────────────────────────────────
+  img.print(f64, PX, 30, symbol);
+  img.print(f16, PX, 104, tokenName);
 
-  hLine(img, PX, 100, 460, Jimp.rgbaToInt(255, 255, 255, 60));
+  // Thin white divider
+  blendRect(img, PX, 132, W - PX - 30, 1, 255, 255, 255, 100);
 
-  // Prices
-  img.print(fontMed, PX,       115, "PRICE THEN");
-  img.print(fontMed, PX + 220, 115, "PRICE NOW");
-  img.print(fontLarge, PX,       138, fmtPrice(priceThen));
-  img.print(fontLarge, PX + 220, 138, fmtPrice(priceNow));
+  // Called at price
+img.print(f16, PX, 145, `mcap   ${fmtMcap(priceNow)}`);
+  const xText = `${sign}${xChange.toFixed(2)}X`;
 
-  // Big % change pill
-  const sign     = isUp ? "+" : "";
-  const arrow    = isUp ? "▲" : "▼";
-  const pctText  = `${arrow} ${sign}${pctChange.toFixed(2)}%`;
-  const pillColor = isUp
-    ? Jimp.rgbaToInt(30, 180, 30, 190)
-    : Jimp.rgbaToInt(190, 30, 50, 190);
-  fillRect(img, PX - 6, 188, 460, 55, pillColor);
-  img.print(fontLarge, PX, 195, pctText);
+  // Solid green or red pill — fully opaque so it pops off background
+  blendRect(img, PX - 5, 182, W - PX - 25, 105, isUp ? 22 : 200, isUp ? 195 : 20, isUp ? 22 : 45, 255);
+  img.print(f64, PX + 10, 197, xText);
 
-  // X multiplier
-  if (xChange >= 1.1 || xChange <= 0.9) {
-    const xLabel = isUp ? `+${xChange.toFixed(2)}x` : `${xChange.toFixed(2)}x`;
-    img.print(fontMed, PX, 258, xLabel);
-  }
+  // ── % change ─────────────────────────────────────────────────────────────
+  img.print(f32, PX, 305, `${sign}${pctChange.toFixed(2)}%`);
 
-  hLine(img, PX, 285, 460, Jimp.rgbaToInt(255, 255, 255, 60));
+  // Divider
+  blendRect(img, PX, 362, W - PX - 30, 1, 255, 255, 255, 100);
 
-  // Timestamp
-  const d = new Date(snapTimestamp * 1000);
-  const snapDate = isNaN(d.getTime()) ? "—" : d.toISOString().slice(0,16).replace("T"," ") + " UTC";
-  img.print(fontMed, PX, 300, `Checked: ${snapDate}  (${timeSince(snapTimestamp)})`);
+  // ── Bottom: time + watermark ──────────────────────────────────────────────
+  img.print(f16, PX,       378, timeSince(snapTimestamp));
+  img.print(f16, PX + 180, 378, `$${symbol}   XPR Radar Bot`);
+  img.print(f16, PX,       406, `dex.protonnz.com`);
 
-  // Watermark
-  img.print(fontMed, PX, 365, "XPR Radar  ·  dex.protonnz.com");
-
-  // Output as JPEG (much smaller than PNG)
-  img.quality(82);
+  img.quality(88);
   return await img.getBufferAsync(Jimp.MIME_JPEG);
 }

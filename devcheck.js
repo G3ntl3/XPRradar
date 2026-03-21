@@ -23,13 +23,18 @@ async function getTokenInfo(symbol) {
 // ─── Get dev balance from holders list (using tokenId) ───────────────────────
 
 async function getDevBalance(tokenId, account) {
-  // Fetch up to 200 holders using correct tokenId-based URL
-  const data = await apiGet(`${INDEXER}/tokens/${tokenId}/holders?limit=200`);
+  // Fetch up to 500 holders — if dev not found, balance is UNKNOWN (not 0)
+  const data = await apiGet(`${INDEXER}/tokens/${tokenId}/holders?limit=500`);
   const holders = data?.holders ?? (Array.isArray(data) ? data : []);
+
+  if (!holders.length) return null; // API failed — unknown
+
   const match = holders.find(h =>
     (h.account ?? "").toLowerCase() === account.toLowerCase()
   );
-  if (!match) return 0;
+
+  if (!match) return null; // Not in holders list — unknown, not confirmed 0
+
   // walletAmount = in wallet, lpAmount = in liquidity pool — sum both
   return parseFloat(match.walletAmount ?? match.amount ?? 0) +
          parseFloat(match.lpAmount ?? 0);
@@ -129,9 +134,10 @@ export async function runDevCheck(symbol) {
 
   const freshWallets = walletChecks.filter(w => w.isFresh);
 
-  // 6. Holding stats
-  const holdingPct = totalSupply > 0 ? (currentBalance / totalSupply) * 100 : 0;
-  const valueUsd   = currentBalance * price;
+  // 6. Holding stats — null means unknown, 0 means confirmed empty
+  const balanceKnown = currentBalance !== null;
+  const holdingPct   = balanceKnown && totalSupply > 0 ? (currentBalance / totalSupply) * 100 : null;
+  const valueUsd     = balanceKnown ? (currentBalance * price) : null;
 
   // ─── Risk scoring ─────────────────────────────────────────────────────────
 
@@ -149,8 +155,11 @@ export async function runDevCheck(symbol) {
     positive.push(`🟢 Dev has not sold any tokens`);
   }
 
-  // Holding checks — 0-5% green, 5-9% yellow, 10%+ red
-  if (currentBalance === 0) {
+  // Holding checks — only score if balance is confirmed
+  if (!balanceKnown) {
+    // Can't confirm — don't penalise, just note it
+    flags.push(`⚪ Dev balance not in top 500 holders — unable to confirm`);
+  } else if (currentBalance === 0) {
     riskScore += 3; flags.push(`🔴 Dev holds 0 tokens — fully exited`);
   } else if (holdingPct >= 10) {
     riskScore += 2; flags.push(`🔴 Dev holds ${holdingPct.toFixed(1)}% — high concentration`);
@@ -184,7 +193,7 @@ export async function runDevCheck(symbol) {
 
   return {
     symbol, tokenName: token.name, creator, price, totalSupply,
-    currentBalance, holdingPct, valueUsd,
+    currentBalance, balanceKnown, holdingPct, valueUsd,
     totalSold, sellCount: devSells.length, buyCount: devBuys.length, lastSell,
     suspiciousTransfers: walletChecks, freshWallets,
     riskScore, riskLabel, riskEmoji, flags, positive,

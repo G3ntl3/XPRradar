@@ -48,3 +48,62 @@ export async function getHolders(symbol, limit = 10) {
   const data = await get(`/tokens/${token.tokenId}/holders?limit=${limit}`);
   return data?.holders ?? (Array.isArray(data) ? data : []);
 }
+
+// ─── Bonding curve data for a specific token ──────────────────────────────────
+// Fetches realXpr from on-chain contract table, threshold from config table
+
+const XPR_NODE = "https://api.protonnz.com";
+
+async function nodePost(body) {
+  try {
+    const res = await fetch(`${XPR_NODE}/v1/chain/get_table_rows`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, json: true }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) return await res.json();
+  } catch (e) {
+    console.warn(`Node POST error: ${e.message}`);
+  }
+  return null;
+}
+
+// Cached threshold — only fetches once
+let _threshold = null;
+
+async function getBondingThreshold() {
+  if (_threshold !== null) return _threshold;
+  const data = await nodePost({
+    code: "simplelaunch",
+    scope: "simplelaunch",
+    table: "config",
+    limit: 1,
+  });
+  _threshold = data?.rows?.[0]?.threshold ?? 500_000_000;
+  return _threshold;
+}
+
+export async function getBondingProgress(tokenId) {
+  // Fetch the token's row from the on-chain table using tokenId as key
+  const [tokenData, threshold] = await Promise.all([
+    nodePost({
+      code: "simplelaunch",
+      scope: "simplelaunch",
+      table: "tokens",
+      lower_bound: tokenId,
+      upper_bound: tokenId,
+      limit: 1,
+    }),
+    getBondingThreshold(),
+  ]);
+
+  const row = tokenData?.rows?.[0];
+  if (!row) return null;
+
+  const realXpr     = parseFloat(row.realXpr ?? 0);
+  const graduated   = row.graduated === 1 || row.graduated === true;
+  const pct         = Math.min((realXpr / threshold) * 100, 100);
+
+  return { realXpr, threshold, pct, graduated };
+}

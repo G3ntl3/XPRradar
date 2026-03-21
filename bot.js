@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Bot, InlineKeyboard, InputFile } from "grammy";
-import { getToken, getAllTokens, getTrades, getHolders } from "./xprApi.js";
+import { getToken, getAllTokens, getTrades, getHolders, getBondingProgress } from "./xprApi.js";
 import { runDevCheck } from "./devcheck.js";
 import { saveSnapshot, getSnapshot, getUserSnapshots } from "./snapshots.js";
 import { generatePnlCard } from "./pnlCard.js";
@@ -67,29 +67,42 @@ function timeSince(ts) {
   return `${Math.floor(secs / 86400)}d ago`;
 }
 
-// Graduation mcap target on SimpleDEX (adjust if protonnz changes it)
-// Based on observed data: tokens graduate around $500-$1000 mcap range
-// The bonding curve fills as mcap grows toward the target
-const GRADUATION_MCAP = 1000; // USD — update if needed
-
-function bondingBar(token) {
+// Graduation mcap target on SimpleDEX
+// Based on observed data: KARMA graduated at ~$264 mcap, MOTHER at $234 is still on-curve
+// The bonding curve target appears to be ~$300 USD mcap
+// bondingBar is now async — fetches real on-chain progress
+async function bondingBar(token) {
   if (token.graduated) {
     return `🎓 <b>Graduated</b>\n   <code>████████████████████</code> 100%`;
   }
 
-  const mcap = token.mcap ?? 0;
-  const pct  = Math.min((mcap / GRADUATION_MCAP) * 100, 99.9);
-  const filled = Math.round(pct / 5);   // 20 blocks total, each = 5%
-  const empty  = 20 - filled;
+  // Try real on-chain data first
+  if (token.tokenId) {
+    try {
+      const bp = await getBondingProgress(token.tokenId);
+      if (bp) {
+        const pct    = Math.min(bp.pct, 99.9);
+        const filled = Math.round(pct / 5);
+        const empty  = 20 - filled;
+        const bar    = "█".repeat(filled) + "░".repeat(empty);
+        const label  = pct >= 75 ? "🔥" : pct >= 50 ? "📈" : pct >= 25 ? "⚡" : "🌱";
+        const xprFmt = bp.realXpr >= 1_000_000
+          ? (bp.realXpr / 1_000_000).toFixed(1) + "M"
+          : (bp.realXpr / 1_000).toFixed(0) + "K";
+        const tgtFmt = (bp.threshold / 1_000_000).toFixed(0) + "M";
+        return (
+          `${label} <b>Bonding Progress</b>\n` +
+          `   <code>${bar}</code> ${pct.toFixed(1)}%\n` +
+          `   ${xprFmt} XPR / ${tgtFmt} XPR target`
+        );
+      }
+    } catch (e) {
+      console.warn("bondingBar on-chain fetch failed:", e.message);
+    }
+  }
 
-  const bar    = "█".repeat(filled) + "░".repeat(empty);
-  const label  = pct >= 75 ? "🔥" : pct >= 50 ? "📈" : pct >= 25 ? "⚡" : "🌱";
-
-  return (
-    `${label} <b>Bonding Progress</b>\n` +
-    `   <code>${bar}</code> ${pct.toFixed(1)}%\n` +
-    `   MCap: $${fmtNum(mcap)} → $${fmtNum(GRADUATION_MCAP)} target`
-  );
+  // Fallback — show just graduated status
+  return `📈 <b>On Curve</b> — progress unavailable`;
 }
 
 function bondStatus(token) {
@@ -151,7 +164,7 @@ async function buildTokenMsg(symbol) {
   msg += `🪙 <b>${t.name}</b> (<code>${t.symbol}</code>)\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
   msg += `💰 <b>Price:</b> <code>${fmtPrice(t.price)}</code>\n`;
-  msg += `\n${bondingBar(t)}\n\n`;
+  msg += `\n${await bondingBar(t)}\n\n`;
   msg += `📊 <b>Market</b>\n`;
   msg += `   MCap:    <code>$${fmtNum(t.mcap)}</code>\n`;
   msg += `   24h Vol: <code>$${fmtNum(t.volume24h)}</code>\n`;
@@ -215,7 +228,7 @@ bot.command("token", async (ctx) => {
     }
 
     // Auto-save price snapshot for /pnl tracking
-    saveSnapshot(ctx.from.id, symbol, result.token.price);
+    saveSnapshot(ctx.from.id, symbol, result.token.mcap ?? result.token.price);
 
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, {
       parse_mode: "HTML",
@@ -247,7 +260,7 @@ bot.command("price", async (ctx) => {
   }
 
   // Auto-save price snapshot for /pnl tracking
-  saveSnapshot(ctx.from.id, symbol, t.price);
+  saveSnapshot(ctx.from.id, symbol, t.mcap ?? t.price);
 
   const kb = new InlineKeyboard()
     .text("📋 Full Info", `token:${symbol}`)
@@ -396,7 +409,7 @@ bot.command("pnl", async (ctx) => {
     for (const [sym, snap] of entries) {
       const ago = timeSince(snap.timestamp);
       msg += `• <b>${sym}</b> — last checked ${ago}\n`;
-      msg += `   Saved price: <code>${fmtPrice(snap.price)}</code>\n\n`;
+      msg += `   MCap at check: <code>$${fmtNum(snap.price)}</code>\n\n`;
     }
     msg += `<i>Run /pnl SYMBOL for full PNL breakdown</i>`;
     return ctx.reply(msg, { parse_mode: "HTML" });
@@ -415,19 +428,21 @@ bot.command("pnl", async (ctx) => {
     return;
   }
 
-  // Get current price
+  // Get current mcap
   const t = await getToken(symbol);
   if (!t) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-      `❌ Could not fetch current price for <b>${symbol}</b>.`, { parse_mode: "HTML" }
+      `❌ Could not fetch current data for <b>${symbol}</b>.`, { parse_mode: "HTML" }
     );
     return;
   }
 
-  const priceThen = snap.price;
-  const priceNow  = t.price;
-  const pctChange = priceThen > 0 ? ((priceNow - priceThen) / priceThen) * 100 : 0;
-  const xChange   = priceThen > 0 ? priceNow / priceThen : 0;
+  // Use mcap for PNL — more meaningful than raw price
+const mcapThen = t.mcap ?? 0;const mcapNow  = t.mcap ?? t.price;
+const priceThen = mcapThen;
+const priceNow  = mcapNow;
+const pctChange = mcapThen > 0.001 ? ((mcapNow - mcapThen) / mcapThen) * 100 : 0;
+const xChange   = mcapThen > 0.001 ? mcapNow / mcapThen : 1;
 
   const kb = new InlineKeyboard()
     .text("🔄 Update Snapshot", `price:${symbol}`)
@@ -441,8 +456,8 @@ bot.command("pnl", async (ctx) => {
     const imageBuffer = await generatePnlCard({
       symbol,
       tokenName:     t.name,
-      priceThen,
-      priceNow,
+      priceThen:     mcapThen,   // mcap when first checked
+      priceNow:      mcapNow,    // mcap now
       pctChange,
       xChange,
       snapTimestamp: snap.timestamp,
@@ -467,8 +482,8 @@ bot.command("pnl", async (ctx) => {
 
     let msg = `📊 <b>PNL — ${t.name} (${symbol})</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
     msg += `⏱ <b>Last checked:</b> ${timeSince(snap.timestamp)}\n\n`;
-    msg += `💰 <b>Price then:</b>  <code>${fmtPrice(priceThen)}</code>\n`;
-    msg += `💰 <b>Price now:</b>   <code>${fmtPrice(priceNow)}</code>\n\n`;
+    msg += `📊 <b>MCap then:</b>  <code>$${fmtNum(mcapThen)}</code>\n`;
+    msg += `📊 <b>MCap now:</b>   <code>$${fmtNum(mcapNow)}</code>\n\n`;
     msg += `${arrow} <b>Change:</b>  ${emoji} <code>${sign}${pctChange.toFixed(2)}%</code>${xStr}\n\n`;
     msg += `<i>Snapshot: ${fmtDateTime(snap.timestamp)}</i>`;
 
@@ -524,15 +539,18 @@ async function buildDevCheckMsg(symbol) {
   msg += `👤 <b>Creator:</b> <code>${r.creator}</code>\n\n`;
 
   msg += `💼 <b>Current Holdings</b>\n`;
-  if (r.currentBalance > 0) {
+  if (!r.balanceKnown) {
+    msg += `   Balance: <code>⚪ Not in top 500 holders</code>\n`;
+    msg += `   Status:  ❓ Unable to confirm — may hold small amount\n\n`;
+  } else if (r.currentBalance > 0) {
     const holdingEmoji = r.holdingPct >= 10 ? "🔴" : r.holdingPct >= 5 ? "🟡" : "🟢";
     msg += `   Balance: <code>${fmtNum(r.currentBalance)} ${r.symbol}</code>\n`;
-    msg += `   Share:   <code>${r.holdingPct.toFixed(2)}%</code> of supply ${holdingEmoji}\n`;
+    msg += `   Share:   ${holdingEmoji} <code>${r.holdingPct.toFixed(2)}%</code> of supply\n`;
     msg += `   Value:   <code>~$${fmtNum(r.valueUsd)}</code>\n`;
     msg += `   Status:  🟢 Still Holding\n\n`;
   } else {
     msg += `   Balance: <code>0 ${r.symbol}</code>\n`;
-    msg += `   Status:  🔴 Dev holds nothing\n\n`;
+    msg += `   Status:  🔴 Dev holds nothing — fully exited\n\n`;
   }
 
   msg += `📤 <b>Sell Activity</b>\n`;
@@ -595,7 +613,7 @@ bot.on("callback_query:data", async (ctx) => {
     // Refresh token message in place
     const result = await buildTokenMsg(symbol);
     if (!result) return ctx.answerCallbackQuery("Token not found");
-    saveSnapshot(ctx.from.id, symbol, result.token.price);
+    saveSnapshot(ctx.from.id, symbol, result.token.mcap ?? result.token.price);
     await ctx.editMessageText(result.msg, {
       parse_mode: "HTML",
       reply_markup: result.kb,
@@ -604,7 +622,7 @@ bot.on("callback_query:data", async (ctx) => {
   } else if (action === "price") {
     const t = await getToken(symbol);
     if (!t) return ctx.answerCallbackQuery("No data found");
-    saveSnapshot(ctx.from.id, symbol, t.price);
+    saveSnapshot(ctx.from.id, symbol, t.mcap ?? t.price);
     const kb = new InlineKeyboard()
       .text("📋 Full Info", `token:${symbol}`)
       .text("🔄 Refresh",   `price:${symbol}`);
