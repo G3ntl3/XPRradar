@@ -149,15 +149,15 @@ export async function runDevCheck(symbol) {
     positive.push(`🟢 Dev has not sold any tokens`);
   }
 
-  // Holding checks
+  // Holding checks — 0-5% green, 5-9% yellow, 10%+ red
   if (currentBalance === 0) {
     riskScore += 3; flags.push(`🔴 Dev holds 0 tokens — fully exited`);
-  } else if (holdingPct > 30) {
-    riskScore += 2; flags.push(`🟡 Dev holds ${holdingPct.toFixed(1)}% — large concentration`);
-  } else if (holdingPct > 5) {
-    positive.push(`🟢 Dev holds ${holdingPct.toFixed(1)}% of supply`);
+  } else if (holdingPct >= 10) {
+    riskScore += 2; flags.push(`🔴 Dev holds ${holdingPct.toFixed(1)}% — high concentration`);
+  } else if (holdingPct >= 5) {
+    riskScore += 1; flags.push(`🟡 Dev holds ${holdingPct.toFixed(1)}% — moderate concentration`);
   } else {
-    positive.push(`🟢 Dev holds small safe amount (${holdingPct.toFixed(1)}%)`);
+    positive.push(`🟢 Dev holds ${holdingPct.toFixed(1)}% of supply — safe amount`);
   }
 
   // Wallet clustering

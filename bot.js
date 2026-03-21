@@ -3,6 +3,7 @@ import { Bot, InlineKeyboard } from "grammy";
 import { getToken, getAllTokens, getTrades, getHolders } from "./xprApi.js";
 import { runDevCheck } from "./devcheck.js";
 import { saveSnapshot, getSnapshot, getUserSnapshots } from "./snapshots.js";
+import { generatePnlCard } from "./pnlCard.js";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN in .env");
@@ -38,12 +39,56 @@ function fmtDate(ts) {
   return new Date(ts * 1000).toISOString().slice(0, 10);
 }
 
+// Safe timestamp formatter — handles both unix int and ISO string
+function fmtTime(ts) {
+  if (!ts) return "—";
+  try {
+    const d = typeof ts === "string" ? new Date(ts) : new Date(ts * 1000);
+    if (isNaN(d.getTime())) return "—";
+    return d.toISOString().slice(11, 16) + " UTC";
+  } catch { return "—"; }
+}
+
+function fmtDateTime(ts) {
+  if (!ts) return "—";
+  try {
+    const d = typeof ts === "string" ? new Date(ts) : new Date(ts * 1000);
+    if (isNaN(d.getTime())) return "—";
+    return d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  } catch { return "—"; }
+}
+
 function timeSince(ts) {
   const secs = Math.floor(Date.now() / 1000) - ts;
   if (secs < 60)                    return `${secs}s ago`;
   if (secs < 3600)                  return `${Math.floor(secs / 60)}m ago`;
   if (secs < 86400)                 return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m ago`;
   return `${Math.floor(secs / 86400)}d ago`;
+}
+
+// Graduation mcap target on SimpleDEX (adjust if protonnz changes it)
+// Based on observed data: tokens graduate around $500-$1000 mcap range
+// The bonding curve fills as mcap grows toward the target
+const GRADUATION_MCAP = 1000; // USD — update if needed
+
+function bondingBar(token) {
+  if (token.graduated) {
+    return `🎓 <b>Graduated</b>\n   <code>████████████████████</code> 100%`;
+  }
+
+  const mcap = token.mcap ?? 0;
+  const pct  = Math.min((mcap / GRADUATION_MCAP) * 100, 99.9);
+  const filled = Math.round(pct / 5);   // 20 blocks total, each = 5%
+  const empty  = 20 - filled;
+
+  const bar    = "█".repeat(filled) + "░".repeat(empty);
+  const label  = pct >= 75 ? "🔥" : pct >= 50 ? "📈" : pct >= 25 ? "⚡" : "🌱";
+
+  return (
+    `${label} <b>Bonding Progress</b>\n` +
+    `   <code>${bar}</code> ${pct.toFixed(1)}%\n` +
+    `   MCap: $${fmtNum(mcap)} → $${fmtNum(GRADUATION_MCAP)} target`
+  );
 }
 
 function bondStatus(token) {
@@ -106,7 +151,7 @@ async function buildTokenMsg(symbol) {
   msg += `🪙 <b>${t.name}</b> (<code>${t.symbol}</code>)\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
   msg += `💰 <b>Price:</b> <code>${fmtPrice(t.price)}</code>\n`;
-  msg += `🏷 <b>Status:</b> ${bondStatus(t)}\n\n`;
+  msg += `\n${bondingBar(t)}\n\n`;
   msg += `📊 <b>Market</b>\n`;
   msg += `   MCap:    <code>$${fmtNum(t.mcap)}</code>\n`;
   msg += `   24h Vol: <code>$${fmtNum(t.volume24h)}</code>\n`;
@@ -238,7 +283,7 @@ bot.command("trades", async (ctx) => {
   let msg = `🔄 <b>Recent ${symbol} Trades</b>\n\n`;
   for (const t of trades) {
     const type   = t.type === "buy" ? "🟢 BUY " : "🔴 SELL";
-    const time   = t.timestamp ? new Date(t.timestamp * 1000).toISOString().slice(11, 16) + " UTC" : "—";
+    const time   = fmtTime(t.timestamp);
     const trader = t.account ?? t.trader ?? "unknown";
     const price  = t.price  ? fmtPrice(t.price)  : "—";
     const amount = t.amount ? fmtNum(t.amount)    : "—";
@@ -266,15 +311,21 @@ bot.command("holders", async (ctx) => {
     return;
   }
 
+  // Get supply for percentage calculation
+  const tokenInfo = await getToken(symbol);
+  const supply = tokenInfo?.circulatingSupply ?? tokenInfo?.supply ?? 0;
+
   let msg = `👥 <b>${symbol} Top Holders</b>\n\n`;
   holders.forEach((h, i) => {
-    const account    = h.account ?? "unknown";
-    const walletAmt  = parseFloat(h.walletAmount ?? h.amount ?? 0);
-    const lpAmt      = parseFloat(h.lpAmount ?? 0);
-    const total      = walletAmt + lpAmt;
+    const account   = h.account ?? "unknown";
+    const walletAmt = parseFloat(h.walletAmount ?? h.amount ?? 0);
+    const lpAmt     = parseFloat(h.lpAmount ?? 0);
+    const total     = walletAmt + lpAmt;
+    const pct       = supply > 0 ? (total / supply * 100) : 0;
     msg += `${i + 1}. <code>${account}</code>\n`;
-    msg += `   💼 ${fmtNum(walletAmt)} ${symbol}`;
-    if (lpAmt > 0) msg += `  🏦 LP: ${fmtNum(lpAmt)}`;
+    msg += `   💼 ${fmtNum(total)} ${symbol}`;
+    if (pct > 0) msg += `  <b>(${pct.toFixed(2)}%)</b>`;
+    if (lpAmt > 0) msg += `\n   🏦 LP: ${fmtNum(lpAmt)}`;
     msg += `\n\n`;
   });
   msg += `<i>Source: dex.protonnz.com</i>`;
@@ -377,49 +428,52 @@ bot.command("pnl", async (ctx) => {
   const priceNow  = t.price;
   const pctChange = priceThen > 0 ? ((priceNow - priceThen) / priceThen) * 100 : 0;
   const xChange   = priceThen > 0 ? priceNow / priceThen : 0;
-  const ago       = timeSince(snap.timestamp);
-
-  // Direction
-  const isUp    = priceNow >= priceThen;
-  const arrow   = isUp ? "📈" : "📉";
-  const sign    = isUp ? "+" : "";
-  const emoji   = isUp ? "🟢" : "🔴";
-
-  // X display — only show if meaningful (>= 1.1x or <= 0.9x)
-  let xStr = "";
-  if (xChange >= 1.1)       xStr = `  |  <b>+${xChange.toFixed(2)}x</b>`;
-  else if (xChange <= 0.9)  xStr = `  |  <b>${xChange.toFixed(2)}x</b>`;
-
-  let msg = `📊 <b>PNL — ${t.name} (${symbol})</b>\n`;
-  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
-  msg += `⏱ <b>Last checked:</b> ${ago}\n\n`;
-  msg += `💰 <b>Price then:</b>  <code>${fmtPrice(priceThen)}</code>\n`;
-  msg += `💰 <b>Price now:</b>   <code>${fmtPrice(priceNow)}</code>\n\n`;
-  msg += `${arrow} <b>Change:</b>  ${emoji} <code>${sign}${pctChange.toFixed(2)}%</code>${xStr}\n\n`;
-
-  // Verdict
-  if (Math.abs(pctChange) < 1) {
-    msg += `😐 <i>Barely moved since you last checked.</i>\n`;
-  } else if (isUp) {
-    if (pctChange >= 100)     msg += `🚀 <i>More than doubled since you last checked!</i>\n`;
-    else if (pctChange >= 50) msg += `🔥 <i>Strong move up since you last checked.</i>\n`;
-    else                      msg += `✅ <i>Up since you last checked.</i>\n`;
-  } else {
-    if (pctChange <= -50)     msg += `💀 <i>Down over 50% since you last checked.</i>\n`;
-    else if (pctChange <= -20) msg += `⚠️ <i>Significant drop since you last checked.</i>\n`;
-    else                       msg += `📉 <i>Down since you last checked.</i>\n`;
-  }
-
-  msg += `\n<i>Snapshot saved: ${new Date(snap.timestamp * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC</i>`;
 
   const kb = new InlineKeyboard()
     .text("🔄 Update Snapshot", `price:${symbol}`)
     .text("📋 Token Info",      `token:${symbol}`);
 
-  await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, {
-    parse_mode: "HTML",
-    reply_markup: kb,
-  });
+  // Delete the loading message first
+  await ctx.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
+
+  // Try to generate the PNL card image
+  try {
+    const imageBuffer = await generatePnlCard({
+      symbol,
+      tokenName:     t.name,
+      priceThen,
+      priceNow,
+      pctChange,
+      xChange,
+      snapTimestamp: snap.timestamp,
+    });
+
+    await ctx.replyWithPhoto(
+      { source: imageBuffer, filename: `pnl_${symbol}.png` },
+      { reply_markup: kb }
+    );
+
+  } catch (imgErr) {
+    // canvas not installed yet — fall back to text
+    console.warn("PNL card failed (canvas not installed?):", imgErr.message);
+
+    const isUp  = priceNow >= priceThen;
+    const arrow = isUp ? "📈" : "📉";
+    const sign  = isUp ? "+" : "";
+    const emoji = isUp ? "🟢" : "🔴";
+    let xStr = "";
+    if (xChange >= 1.1)      xStr = `  |  <b>+${xChange.toFixed(2)}x</b>`;
+    else if (xChange <= 0.9) xStr = `  |  <b>${xChange.toFixed(2)}x</b>`;
+
+    let msg = `📊 <b>PNL — ${t.name} (${symbol})</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+    msg += `⏱ <b>Last checked:</b> ${timeSince(snap.timestamp)}\n\n`;
+    msg += `💰 <b>Price then:</b>  <code>${fmtPrice(priceThen)}</code>\n`;
+    msg += `💰 <b>Price now:</b>   <code>${fmtPrice(priceNow)}</code>\n\n`;
+    msg += `${arrow} <b>Change:</b>  ${emoji} <code>${sign}${pctChange.toFixed(2)}%</code>${xStr}\n\n`;
+    msg += `<i>Snapshot: ${fmtDateTime(snap.timestamp)}</i>`;
+
+    await ctx.reply(msg, { parse_mode: "HTML", reply_markup: kb });
+  }
 });
 
 // ─── /devcheck ────────────────────────────────────────────────────────────────
@@ -471,8 +525,9 @@ async function buildDevCheckMsg(symbol) {
 
   msg += `💼 <b>Current Holdings</b>\n`;
   if (r.currentBalance > 0) {
+    const holdingEmoji = r.holdingPct >= 10 ? "🔴" : r.holdingPct >= 5 ? "🟡" : "🟢";
     msg += `   Balance: <code>${fmtNum(r.currentBalance)} ${r.symbol}</code>\n`;
-    msg += `   Share:   <code>${r.holdingPct.toFixed(2)}%</code> of supply\n`;
+    msg += `   Share:   <code>${r.holdingPct.toFixed(2)}%</code> of supply ${holdingEmoji}\n`;
     msg += `   Value:   <code>~$${fmtNum(r.valueUsd)}</code>\n`;
     msg += `   Status:  🟢 Still Holding\n\n`;
   } else {
@@ -486,8 +541,7 @@ async function buildDevCheckMsg(symbol) {
     msg += `   Total Sold: <code>${fmtNum(r.totalSold)} ${r.symbol}</code> (${soldPct}%)\n`;
     msg += `   Sell Txns:  ${r.sellCount}\n`;
     if (r.lastSell?.timestamp) {
-      const ts = new Date(r.lastSell.timestamp * 1000).toISOString().slice(0, 16).replace("T", " ");
-      msg += `   Last Sell:  ${ts} UTC\n`;
+      msg += `   Last Sell:  ${fmtDateTime(r.lastSell.timestamp)}\n`;
     }
   } else {
     msg += `   Total Sold: 0 — never sold ✅\n`;
@@ -570,7 +624,7 @@ bot.on("callback_query:data", async (ctx) => {
     let msg = `🔄 <b>Recent ${symbol} Trades</b>\n\n`;
     for (const t of trades) {
       const type = t.type === "buy" ? "🟢 BUY " : "🔴 SELL";
-      const time = t.timestamp ? new Date(t.timestamp * 1000).toISOString().slice(11, 16) + " UTC" : "—";
+      const time = fmtTime(t.timestamp);
       msg += `${type}  ${fmtPrice(t.price)}  ×${fmtNum(t.amount)}\n`;
       msg += `   👤 <code>${t.account ?? "unknown"}</code>  🕐 ${time}\n\n`;
     }
@@ -579,12 +633,20 @@ bot.on("callback_query:data", async (ctx) => {
   } else if (action === "holders") {
     const holders = await getHolders(symbol, 10);
     if (!holders.length) return ctx.reply(`❌ No holder data found for <b>${symbol}</b>.`, { parse_mode: "HTML" });
+    const tokenInfo = await getToken(symbol);
+    const supply = tokenInfo?.circulatingSupply ?? tokenInfo?.supply ?? 0;
     let msg = `👥 <b>${symbol} Top Holders</b>\n\n`;
     holders.forEach((h, i) => {
-      const amt = fmtNum(h.walletAmount ?? h.amount ?? 0);
-      const pct = h.percentage ? ` (${parseFloat(h.percentage).toFixed(2)}%)` : "";
-      msg += `${i + 1}. <code>${h.account ?? "unknown"}</code>\n`;
-      msg += `   ${amt} ${symbol}${pct}\n\n`;
+      const account   = h.account ?? "unknown";
+      const walletAmt = parseFloat(h.walletAmount ?? h.amount ?? 0);
+      const lpAmt     = parseFloat(h.lpAmount ?? 0);
+      const total     = walletAmt + lpAmt;
+      const pct       = supply > 0 ? (total / supply * 100) : 0;
+      msg += `${i + 1}. <code>${account}</code>\n`;
+      msg += `   💼 ${fmtNum(total)} ${symbol}`;
+      if (pct > 0) msg += `  <b>(${pct.toFixed(2)}%)</b>`;
+      if (lpAmt > 0) msg += `\n   🏦 LP: ${fmtNum(lpAmt)}`;
+      msg += `\n\n`;
     });
     msg += `<i>Source: dex.protonnz.com</i>`;
     await ctx.reply(msg, { parse_mode: "HTML" });
