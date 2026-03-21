@@ -64,83 +64,68 @@ export async function generatePnlCard({
 }) {
   const isUp = pctChange >= 0;
 
-  // Load background
+  // Load background — resize to 800x400 (safe for Telegram's 10MB limit)
   let img;
   try {
     img = await Jimp.read(BG_PATH);
-    // Resize to standard card size
-    img.resize(1100, 550);
+    img.resize(800, 400);
   } catch {
-    // Fallback: solid dark purple background
-    img = new Jimp(1100, 550, 0x1a0033ff);
+    img = new Jimp(800, 400, 0x1a0033ff);
   }
 
   // Dark overlay on right half for readability
   const overlayColour = Jimp.rgbaToInt(0, 0, 0, 170);
-  fillRect(img, 420, 0, 680, 550, overlayColour);
+  fillRect(img, 310, 0, 490, 400, overlayColour);
 
-  // Subtle gradient fade on left edge of overlay
-  for (let x = 380; x < 420; x++) {
-    const alpha = Math.round(((x - 380) / 40) * 170);
-    const fade = Jimp.rgbaToInt(0, 0, 0, alpha);
-    fillRect(img, x, 0, 1, 550, fade);
+  for (let x = 275; x < 310; x++) {
+    const alpha = Math.round(((x - 275) / 35) * 170);
+    fillRect(img, x, 0, 1, 400, Jimp.rgbaToInt(0, 0, 0, alpha));
   }
 
-  // Load built-in jimp font
-  const fontLarge  = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
-  const fontMed    = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
-  const fontSmall  = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+  const fontLarge = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+  const fontMed   = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
 
-  // Green/red font for change
-  const fontGreen = await Jimp.loadFont(
-    isUp ? Jimp.FONT_SANS_64_WHITE : Jimp.FONT_SANS_64_WHITE
-  );
+  const PX = 325;
 
-  const PX = 450;  // left edge of text panel
+  // Token name
+  img.print(fontLarge, PX, 30, tokenName);
+  img.print(fontMed,   PX, 72, `$${symbol}  ·  XPR Network`);
 
-  // ── Token name ──────────────────────────────────────────────────────────────
-  img.print(fontLarge, PX, 55, tokenName);
-  img.print(fontSmall, PX, 128, `$${symbol}  ·  XPR Network  ·  SimpleDEX`);
+  hLine(img, PX, 100, 460, Jimp.rgbaToInt(255, 255, 255, 60));
 
-  // Divider
-  hLine(img, PX, 158, 620, Jimp.rgbaToInt(255, 255, 255, 60));
+  // Prices
+  img.print(fontMed, PX,       115, "PRICE THEN");
+  img.print(fontMed, PX + 220, 115, "PRICE NOW");
+  img.print(fontLarge, PX,       138, fmtPrice(priceThen));
+  img.print(fontLarge, PX + 220, 138, fmtPrice(priceNow));
 
-  // ── Price row ───────────────────────────────────────────────────────────────
-  img.print(fontSmall, PX,       175, "PRICE THEN");
-  img.print(fontSmall, PX + 300, 175, "PRICE NOW");
-
-  img.print(fontMed, PX,       200, fmtPrice(priceThen));
-  img.print(fontMed, PX + 300, 200, fmtPrice(priceNow));
-
-  // ── Big % change ────────────────────────────────────────────────────────────
-  const sign    = isUp ? "+" : "";
-  const arrow   = isUp ? "▲" : "▼";
-  const pctText = `${arrow} ${sign}${pctChange.toFixed(2)}%`;
-
-  // Coloured background pill behind the number
+  // Big % change pill
+  const sign     = isUp ? "+" : "";
+  const arrow    = isUp ? "▲" : "▼";
+  const pctText  = `${arrow} ${sign}${pctChange.toFixed(2)}%`;
   const pillColor = isUp
-    ? Jimp.rgbaToInt(30, 200, 30, 180)
-    : Jimp.rgbaToInt(200, 30, 60, 180);
-  fillRect(img, PX - 8, 258, 580, 80, pillColor);
+    ? Jimp.rgbaToInt(30, 180, 30, 190)
+    : Jimp.rgbaToInt(190, 30, 50, 190);
+  fillRect(img, PX - 6, 188, 460, 55, pillColor);
+  img.print(fontLarge, PX, 195, pctText);
 
-  img.print(fontLarge, PX, 265, pctText);
-
-  // ── X multiplier ────────────────────────────────────────────────────────────
+  // X multiplier
   if (xChange >= 1.1 || xChange <= 0.9) {
     const xLabel = isUp ? `+${xChange.toFixed(2)}x` : `${xChange.toFixed(2)}x`;
-    img.print(fontMed, PX, 360, xLabel);
+    img.print(fontMed, PX, 258, xLabel);
   }
 
-  // Divider
-  hLine(img, PX, 405, 620, Jimp.rgbaToInt(255, 255, 255, 60));
+  hLine(img, PX, 285, 460, Jimp.rgbaToInt(255, 255, 255, 60));
 
-  // ── Timestamp ───────────────────────────────────────────────────────────────
+  // Timestamp
   const d = new Date(snapTimestamp * 1000);
-  const snapDate = isNaN(d.getTime()) ? "—" : d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
-  img.print(fontSmall, PX, 420, `Checked: ${snapDate}  (${timeSince(snapTimestamp)})`);
+  const snapDate = isNaN(d.getTime()) ? "—" : d.toISOString().slice(0,16).replace("T"," ") + " UTC";
+  img.print(fontMed, PX, 300, `Checked: ${snapDate}  (${timeSince(snapTimestamp)})`);
 
-  // ── Watermark ───────────────────────────────────────────────────────────────
-  img.print(fontSmall, PX, 510, "XPR Radar Bot  ·  dex.protonnz.com");
+  // Watermark
+  img.print(fontMed, PX, 365, "XPR Radar  ·  dex.protonnz.com");
 
-  return await img.getBufferAsync(Jimp.MIME_PNG);
+  // Output as JPEG (much smaller than PNG)
+  img.quality(82);
+  return await img.getBufferAsync(Jimp.MIME_JPEG);
 }

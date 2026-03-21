@@ -1,9 +1,10 @@
 import "dotenv/config";
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { getToken, getAllTokens, getTrades, getHolders } from "./xprApi.js";
 import { runDevCheck } from "./devcheck.js";
 import { saveSnapshot, getSnapshot, getUserSnapshots } from "./snapshots.js";
 import { generatePnlCard } from "./pnlCard.js";
+import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSubscribedToLaunches } from "./launchNotifier.js";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN in .env");
@@ -109,6 +110,7 @@ bot.command("start", async (ctx) => {
     `/trades &lt;SYMBOL&gt; — Recent swaps\n` +
     `/holders &lt;SYMBOL&gt; — Top holders\n` +
     `/devcheck &lt;SYMBOL&gt; — Dev wallet risk check\n` +
+    `/launch — Get notified of new token launches\n` +
     `/tokens — Browse listed tokens\n` +
     `/help — Show commands\n\n` +
     `<i>Try: /token MARSH then come back and run /pnl MARSH</i>`,
@@ -130,11 +132,9 @@ bot.command("help", async (ctx) => {
     `🔄 /trades MARSH — Recent swaps\n\n` +
     `👥 /holders MARSH — Top holders\n\n` +
     `🪙 /tokens — All tokens on SimpleDEX\n\n` +
-    `🕵️ /devcheck MARSH — Dev wallet analysis:\n` +
-    `   Is dev still holding?\n` +
-    `   Has dev sold? How much?\n` +
-    `   Suspicious wallet transfers?\n` +
-    `   Risk score 1–10 with flags\n\n` +
+    `🕵️ /devcheck MARSH — Dev wallet analysis\n\n` +
+    `🚀 /launch — Subscribe to new token launch alerts\n` +
+    `   /launch stop — Unsubscribe\n\n` +
     `<i>Data: indexer.protonnz.com</i>`,
     { parse_mode: "HTML" }
   );
@@ -449,7 +449,7 @@ bot.command("pnl", async (ctx) => {
     });
 
     await ctx.replyWithPhoto(
-      { source: imageBuffer, filename: `pnl_${symbol}.png` },
+      new InputFile(imageBuffer, `pnl_${symbol}.jpg`),
       { reply_markup: kb }
     );
 
@@ -668,8 +668,50 @@ bot.on("callback_query:data", async (ctx) => {
   }
 });
 
+// ─── /launch — subscribe to new token notifications ──────────────────────────
+
+bot.command("launch", async (ctx) => {
+  const arg = ctx.match?.trim().toLowerCase();
+
+  if (arg === "stop" || arg === "off" || arg === "unsubscribe") {
+    unsubscribeFromLaunches(ctx.chat.id);
+    await ctx.reply(
+      `🔕 <b>Launch notifications off.</b>\n\nUse /launch to turn them back on.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Toggle — if already subscribed, show status
+  if (isSubscribedToLaunches(ctx.chat.id)) {
+    await ctx.reply(
+      `✅ <b>Already subscribed to launch alerts!</b>\n\n` +
+      `You'll get notified when new tokens launch on SimpleDEX.\n\n` +
+      `Use <code>/launch stop</code> to unsubscribe.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  subscribeToLaunches(ctx.chat.id);
+  await ctx.reply(
+    `🚀 <b>Launch alerts ON!</b>\n\n` +
+    `You'll be notified whenever a new token launches on:\n` +
+    `<a href="https://dex.protonnz.com">dex.protonnz.com</a>\n\n` +
+    `Each alert includes:\n` +
+    `• Token name & symbol\n` +
+    `• Creator wallet\n` +
+    `• Starting price & mcap\n` +
+    `• Bonding curve status\n` +
+    `• Quick links to /token and /devcheck\n\n` +
+    `Use <code>/launch stop</code> to unsubscribe.`,
+    { parse_mode: "HTML", disable_web_page_preview: true }
+  );
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => console.error("Bot error:", err.message));
 console.log("🚀 XPR Radar Bot starting...");
+startLaunchNotifier(bot);
 bot.start();
