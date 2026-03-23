@@ -37,6 +37,12 @@ function saveSeen(set) {
 
 // ─── Subscription management ──────────────────────────────────────────────────
 
+let _autoBuyHandler = null;
+
+export function registerAutoBuyHandler(fn) {
+  _autoBuyHandler = fn;
+}
+
 export function subscribeToLaunches(chatId) {
   const subs = loadSubs();
   subs[String(chatId)] = true;
@@ -102,12 +108,11 @@ function buildLaunchMsg(token) {
   msg += `🏷 Status: ${status}\n`;
 
   if (token.description) {
-    const desc = token.description.trim().slice(0, 100);
-    msg += `\n📝 <i>${desc}${token.description.length > 100 ? "…" : ""}</i>\n`;
+    const desc = token.description.trim().slice(0, 120);
+    msg += `\n📝 <i>${desc}${token.description.length > 120 ? "…" : ""}</i>\n`;
   }
 
-  msg += `\n<i>Use /token ${token.symbol} for full info</i>`;
-  msg += `\n<i>Use /devcheck ${token.symbol} for rug check</i>`;
+  msg += `\n/token_${token.symbol}   /devcheck_${token.symbol}`;
   return msg;
 }
 
@@ -135,26 +140,39 @@ export function startLaunchNotifier(bot) {
 }
 
 async function poll(bot) {
-  const subs = loadSubs();
-  if (Object.keys(subs).length === 0) return;  // no subscribers, skip
-
+  const subs   = loadSubs();
   const seen   = loadSeen();
   const tokens = await fetchLatestTokens();
   const newTokens = tokens.filter(t => !seen.has(t.tokenId));
 
   if (!newTokens.length) return;
 
-  // Mark as seen
+  // Always mark as seen — even if no subscribers, so we don't backfill later
   for (const t of newTokens) seen.add(t.tokenId);
   saveSeen(seen);
+
+  console.log(`🆕 New tokens detected: ${newTokens.map(t => t.symbol).join(", ")}`);
+
+  // No subscribers — nothing to send
+  if (Object.keys(subs).length === 0) {
+    console.log("No subscribers — skipping notifications.");
+    return;
+  }
 
   // Notify all subscribers
   for (const t of newTokens) {
     const msg = buildLaunchMsg(t);
+    console.log(`📣 Notifying ${Object.keys(subs).length} subscribers about ${t.symbol}`);
     for (const chatId of Object.keys(subs)) {
       await bot.api.sendMessage(Number(chatId), msg, { parse_mode: "HTML" })
         .catch(e => console.warn(`Launch notify failed for ${chatId}: ${e.message}`));
       await new Promise(r => setTimeout(r, 100));
+    }
+    // Trigger auto-buy for all users who have it enabled
+    if (_autoBuyHandler) {
+      await _autoBuyHandler(bot, t).catch(e =>
+        console.warn(`Auto-buy handler error for ${t.symbol}: ${e.message}`)
+      );
     }
   }
 }
