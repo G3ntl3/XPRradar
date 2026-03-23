@@ -13,11 +13,16 @@ import { JsSignatureProvider } from "eosjs/dist/eosjs-jssig.js";
 import fetch from "node-fetch";
 import { getPrivateKey } from "./wallet.js";
 
-const RPC_ENDPOINT = "https://api.protonnz.com";
-const CONTRACT     = "simplelaunch";
-const XPR_CONTRACT = "eosio.token";
-const XPR_SYMBOL   = "XPR";
-const XPR_DECIMALS = 4;
+const RPC_ENDPOINT    = "https://api.protonnz.com";
+const CONTRACT        = "simplelaunch";
+const XPR_CONTRACT    = "eosio.token";
+const XPR_SYMBOL      = "XPR";
+const XPR_DECIMALS    = 4;
+
+// Master account — pays for new account creation
+// Set in .env: MASTER_ACCOUNT and MASTER_PRIVATE_KEY
+const MASTER_ACCOUNT  = process.env.MASTER_ACCOUNT;
+const MASTER_KEY      = process.env.MASTER_PRIVATE_KEY;
 
 function getRpc() {
   return new JsonRpc(RPC_ENDPOINT, { fetch });
@@ -39,13 +44,73 @@ function rawTokenAmount(amount, precision = 4) {
   return Math.floor(parseFloat(amount) * Math.pow(10, precision));
 }
 
+// ─── Create XPR account on-chain ─────────────────────────────────────────────
+// Master account pays RAM + account creation fees
+// newAccountName must be 12 chars, lowercase a-z, 1-5 only
+
+export async function createXprAccount(newAccountName, ownerPublicKey) {
+  if (!MASTER_ACCOUNT || !MASTER_KEY) {
+    throw new Error("MASTER_ACCOUNT or MASTER_PRIVATE_KEY not set in .env");
+  }
+
+  const api = getApi(MASTER_KEY);
+
+  const result = await api.transact({
+    actions: [
+      // Create the account
+      {
+        account:       "eosio",
+        name:          "newaccount",
+        authorization: [{ actor: MASTER_ACCOUNT, permission: "active" }],
+        data: {
+          creator: MASTER_ACCOUNT,
+          name:    newAccountName,
+          owner: {
+            threshold: 1,
+            keys: [{ key: ownerPublicKey, weight: 1 }],
+            accounts: [],
+            waits: [],
+          },
+          active: {
+            threshold: 1,
+            keys: [{ key: ownerPublicKey, weight: 1 }],
+            accounts: [],
+            waits: [],
+          },
+        },
+      },
+      // Buy RAM for the new account (4096 bytes = enough for basic account)
+      {
+        account:       "eosio",
+        name:          "buyrambytes",
+        authorization: [{ actor: MASTER_ACCOUNT, permission: "active" }],
+        data: {
+          payer:    MASTER_ACCOUNT,
+          receiver: newAccountName,
+          bytes:    4096,
+        },
+      },
+    ],
+  }, {
+    blocksBehind:  3,
+    expireSeconds: 30,
+  });
+
+  return result;
+}
+
 // ─── Get XPR balance ──────────────────────────────────────────────────────────
 
 export async function getXprBalance(accountName) {
   try {
-    const rpc  = getRpc();
-    const rows = await rpc.get_currency_balance(XPR_CONTRACT, accountName, XPR_SYMBOL);
-    if (!rows?.length) return 0;
+    const res = await fetch(`${RPC_ENDPOINT}/v1/chain/get_currency_balance`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ code: XPR_CONTRACT, account: accountName, symbol: XPR_SYMBOL }),
+      signal:  AbortSignal.timeout(8000),
+    });
+    const rows = await res.json();
+    if (!Array.isArray(rows) || !rows.length) return 0;
     return parseFloat(rows[0].split(" ")[0]);
   } catch (e) {
     console.warn("getXprBalance error:", e.message);

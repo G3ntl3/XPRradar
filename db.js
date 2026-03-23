@@ -1,63 +1,122 @@
 /**
- * MongoDB connection manager
- * Reuses a single connection across all modules
- *
- * Required env var:
- *   MONGODB_URI — e.g. mongodb+srv://user:pass@cluster.mongodb.net/xprradar
+ * DB — JSON file storage fallback
+ * Replaces MongoDB with local JSON files
+ * Drop-in replacement — same API as MongoDB version
  */
 
-import { MongoClient } from "mongodb";
+import fs from "fs";
+import path from "path";
 
-const URI = process.env.MONGODB_URI;
-const DB  = "xprradar";
+const DATA_DIR = "./data";
 
-let _client = null;
-let _db     = null;
-let _connecting = false;
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-export async function getDb() {
-  // Return existing connection if healthy
-  if (_db && _client) {
-    try {
-      await _client.db("admin").command({ ping: 1 });
-      return _db;
-    } catch {
-      // Connection dropped — reset and reconnect
-      _db = null;
-      _client = null;
-    }
-  }
+function filePath(collection) {
+  return path.join(DATA_DIR, `${collection}.json`);
+}
 
-  if (!URI) {
-    throw new Error("MONGODB_URI not set in .env — add it and restart");
-  }
-
-  // Prevent multiple simultaneous connection attempts
-  if (_connecting) {
-    await new Promise(r => setTimeout(r, 2000));
-    return getDb();
-  }
-
-  _connecting = true;
+function readCollection(collection) {
+  const fp = filePath(collection);
   try {
-    _client = new MongoClient(URI, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS:         10000,
-    });
-    await _client.connect();
-    _db = _client.db(DB);
-    console.log("✅ MongoDB connected");
-    return _db;
-  } catch (e) {
-    _client = null;
-    _db     = null;
-    throw e;
-  } finally {
-    _connecting = false;
+    if (fs.existsSync(fp)) return JSON.parse(fs.readFileSync(fp, "utf8"));
+  } catch {}
+  return [];
+}
+
+function writeCollection(collection, data) {
+  fs.writeFileSync(filePath(collection), JSON.stringify(data, null, 2));
+}
+
+function generateId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function matchesFilter(doc, filter) {
+  return Object.entries(filter).every(([k, v]) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      // Handle simple operators
+      if (v.$ne !== undefined) return doc[k] !== v.$ne;
+    }
+    return doc[k] === v;
+  });
+}
+
+// ─── Collection class — mimics MongoDB collection API ─────────────────────────
+
+class JsonCollection {
+  constructor(name) {
+    this.name = name;
+  }
+
+  async findOne(filter) {
+    const docs = readCollection(this.name);
+    return docs.find(d => matchesFilter(d, filter)) ?? null;
+  }
+
+  async find(filter = {}) {
+    const docs = readCollection(this.name);
+    const results = docs.filter(d => matchesFilter(d, filter));
+    return {
+      toArray: async () => results,
+      sort: (s) => ({ 
+        limit: (n) => ({ 
+          toArray: async () => {
+            const key  = Object.keys(s)[0];
+            const dir  = s[key];
+            return [...results]
+              .sort((a, b) => dir === -1 ? (b[key] > a[key] ? 1 : -1) : (a[key] > b[key] ? 1 : -1))
+              .slice(0, n);
+          }
+        }),
+        toArray: async () => results
+      }),
+      limit: (n) => ({ toArray: async () => results.slice(0, n) }),
+    };
+  }
+
+  async insertOne(doc) {
+    const docs = readCollection(this.name);
+    const newDoc = { _id: generateId(), ...doc };
+    docs.push(newDoc);
+    writeCollection(this.name, docs);
+    return { insertedId: newDoc._id };
+  }
+
+  async updateOne(filter, update) {
+    const docs  = readCollection(this.name);
+    const idx   = docs.findIndex(d => matchesFilter(d, filter));
+    if (idx === -1) return { matchedCount: 0 };
+    if (update.$set) Object.assign(docs[idx], update.$set);
+    if (update.$push) {
+      for (const [k, v] of Object.entries(update.$push)) {
+        if (!docs[idx][k]) docs[idx][k] = [];
+        docs[idx][k].push(v);
+      }
+    }
+    writeCollection(this.name, docs);
+    return { matchedCount: 1 };
+  }
+
+  async deleteOne(filter) {
+    const docs  = readCollection(this.name);
+    const idx   = docs.findIndex(d => matchesFilter(d, filter));
+    if (idx === -1) return { deletedCount: 0 };
+    docs.splice(idx, 1);
+    writeCollection(this.name, docs);
+    return { deletedCount: 1 };
   }
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+const _collections = {};
+
 export async function getMongoCollection(name) {
-  const db = await getDb();
-  return db.collection(name);
+  if (!_collections[name]) _collections[name] = new JsonCollection(name);
+  return _collections[name];
+}
+
+export async function getDb() {
+  return { collection: (name) => new JsonCollection(name) };
 }

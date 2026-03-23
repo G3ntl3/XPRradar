@@ -1,5 +1,8 @@
 node_modules/
-bot_data.json
-snapshots.json
 .env
+.env copy
 .env33
+snapshots.json
+launch_subs.json
+seen_tokens.json
+data/
