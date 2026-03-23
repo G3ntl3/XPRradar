@@ -1,16 +1,19 @@
 /**
  * Wallet Manager
- * Generates BIP39 seed phrases, derives XPR keypairs,
- * stores AES-256 encrypted private keys in MongoDB per user.
+ * Generates BIP39 seed phrases, derives XPR keypairs using proper
+ * BIP44 derivation path m/44'/194'/0'/0/0 (EOSIO coin type 194)
+ * compatible with WebAuth wallet import.
  *
- * Required env vars:
- *   WALLET_ENCRYPT_KEY  — strong random string, never change it
- *   MONGODB_URI         — MongoDB Atlas connection string
+ * npm install bip39 hdkey tiny-secp256k1 eosjs
  */
 
 import crypto from "crypto";
 import * as bip39 from "bip39";
+import HDKey from "hdkey";
 import { getMongoCollection } from "./db.js";
+
+// EOSIO BIP44 derivation path (coin type 194)
+const DERIVATION_PATH = "m/44'/194'/0'/0/0";
 
 // ─── Encryption ───────────────────────────────────────────────────────────────
 
@@ -20,9 +23,9 @@ const ENC_KEY = () => {
 };
 
 export function encryptKey(text) {
-  const iv      = crypto.randomBytes(16);
-  const cipher  = crypto.createCipheriv("aes-256-cbc", ENC_KEY(), iv);
-  const enc     = Buffer.concat([cipher.update(text), cipher.final()]);
+  const iv     = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", ENC_KEY(), iv);
+  const enc    = Buffer.concat([cipher.update(text), cipher.final()]);
   return iv.toString("hex") + ":" + enc.toString("hex");
 }
 
@@ -37,36 +40,18 @@ export function decryptKey(text) {
   ]).toString();
 }
 
-// ─── Key derivation from BIP39 seed ──────────────────────────────────────────
-// EOSIO uses secp256k1 — we derive a 32-byte private key from the seed
-// then convert to WIF format for eosjs
+// ─── EOSIO WIF encoding ───────────────────────────────────────────────────────
 
-function seedToEosPrivateKey(seedBuffer) {
-  // Use first 32 bytes of seed as raw private key
-  const rawKey  = seedBuffer.slice(0, 32);
-  // WIF encoding for EOSIO: version byte 0x80 + key + checksum
-  const version = Buffer.from([0x80]);
-  const payload = Buffer.concat([version, rawKey]);
-  // Double SHA256 checksum
-  const h1      = crypto.createHash("sha256").update(payload).digest();
-  const h2      = crypto.createHash("sha256").update(h1).digest();
-  const checksum = h2.slice(0, 4);
-  const wif     = Buffer.concat([payload, checksum]);
-  // Base58 encode
-  return toBase58(wif);
-}
-
-const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_ALPHA = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 function toBase58(buf) {
-  let num = BigInt("0x" + buf.toString("hex"));
+  let num    = BigInt("0x" + buf.toString("hex"));
   let result = "";
   const base = BigInt(58);
   while (num > 0n) {
-    result = BASE58_ALPHABET[Number(num % base)] + result;
-    num = num / base;
+    result = BASE58_ALPHA[Number(num % base)] + result;
+    num    = num / base;
   }
-  // Leading zeros
   for (const byte of buf) {
     if (byte !== 0) break;
     result = "1" + result;
@@ -74,39 +59,67 @@ function toBase58(buf) {
   return result;
 }
 
+function privateKeyToWif(rawPrivKeyHex) {
+  const keyBuf  = Buffer.from(rawPrivKeyHex, "hex");
+  const payload = Buffer.concat([Buffer.from([0x80]), keyBuf]);
+  const h1      = crypto.createHash("sha256").update(payload).digest();
+  const h2      = crypto.createHash("sha256").update(h1).digest();
+  const full    = Buffer.concat([payload, h2.slice(0, 4)]);
+  return toBase58(full);
+}
+
+// ─── EOSIO public key encoding ────────────────────────────────────────────────
+
+function publicKeyToEos(pubKeyBuf) {
+  // Checksum = RIPEMD160 of compressed public key
+  const checksum = crypto.createHash("ripemd160").update(pubKeyBuf).digest().slice(0, 4);
+  const full     = Buffer.concat([pubKeyBuf, checksum]);
+  return "PUB_K1_" + toBase58(full);
+}
+
+// ─── Derive keypair from mnemonic ─────────────────────────────────────────────
+
+export async function deriveKeypairFromMnemonic(mnemonic) {
+  const seed       = await bip39.mnemonicToSeed(mnemonic);
+  const hdkey      = HDKey.fromMasterSeed(seed);
+  const child      = hdkey.derive(DERIVATION_PATH);
+
+  const privKeyHex = child.privateKey.toString("hex");
+  const pubKeyBuf  = child.publicKey; // compressed 33 bytes
+
+  const wif        = privateKeyToWif(privKeyHex);
+  const pubKey     = publicKeyToEos(pubKeyBuf);
+
+  return { wif, pubKey, privKeyHex };
+}
+
 // ─── Wallet creation ──────────────────────────────────────────────────────────
 
 export async function createWallet(userId) {
   const col = await getMongoCollection("wallets");
 
-  // Check if user already has a wallet
   const existing = await col.findOne({ userId: String(userId) });
   if (existing) return { exists: true, accountName: existing.accountName };
 
-  // Generate 12-word seed phrase
-  const mnemonic  = bip39.generateMnemonic(128);
-  const seedBuf   = await bip39.mnemonicToSeed(mnemonic);
-  const privateKeyWif = seedToEosPrivateKey(seedBuf);
+  // Generate 12-word BIP39 mnemonic
+  const mnemonic = bip39.generateMnemonic(128);
 
-  // Derive public key using eosjs
-  const { PrivateKey } = await import("eosjs/dist/eosjs-jssig.js");
-  const privKey   = PrivateKey.fromString(privateKeyWif);
-  const pubKey    = privKey.getPublicKey().toString();
+  // Derive keypair using proper BIP44 path
+  const { wif, pubKey } = await deriveKeypairFromMnemonic(mnemonic);
 
-  // Account name: "xrdr" + 8 char hash of userId
-  const hash      = crypto.createHash("sha256").update(String(userId)).digest("hex");
-  const accountName = "xrdr" + hash.slice(0, 8); // 12 chars max on EOSIO
+  // Account name: "xrdr" + 8 char hash (max 12 chars on EOSIO)
+  const hash        = crypto.createHash("sha256").update(String(userId)).digest("hex");
+  const accountName = "xrdr" + hash.slice(0, 8);
 
-  // Store encrypted key in MongoDB
   await col.insertOne({
-    userId:         String(userId),
+    userId:          String(userId),
     accountName,
-    publicKey:      pubKey,
-    privateKeyEnc:  encryptKey(privateKeyWif),
-    createdAt:      new Date(),
-    autoBuyXpr:     5,      // default 5 XPR per trade
-    autoSellX:      3,      // default 3x target
-    autoBuyEnabled: false,  // off until user explicitly enables
+    publicKey:       pubKey,
+    privateKeyEnc:   encryptKey(wif),
+    createdAt:       new Date(),
+    autoBuyXpr:      5,
+    autoSellX:       3,
+    autoBuyEnabled:  false,
     autoSellEnabled: false,
   });
 
@@ -131,10 +144,7 @@ export async function getPrivateKey(userId) {
 
 export async function updateWalletSettings(userId, settings) {
   const col = await getMongoCollection("wallets");
-  await col.updateOne(
-    { userId: String(userId) },
-    { $set: settings }
-  );
+  await col.updateOne({ userId: String(userId) }, { $set: settings });
 }
 
 export async function getAllActiveAutobuyers() {
