@@ -57,7 +57,6 @@ function base58Encode(buf) {
 // ─── EOSIO WIF private key ────────────────────────────────────────────────────
 
 function toWif(privKeyBuf) {
-  // version 0x80 + key bytes
   const payload  = Buffer.concat([Buffer.from([0x80]), privKeyBuf]);
   const h1       = crypto.createHash("sha256").update(payload).digest();
   const h2       = crypto.createHash("sha256").update(h1).digest();
@@ -65,26 +64,21 @@ function toWif(privKeyBuf) {
   return base58Encode(Buffer.concat([payload, checksum]));
 }
 
-// ─── EOSIO public key (legacy EOS format) ────────────────────────────────────
-// Format: "EOS" + base58(compressedPubKey + ripemd160(compressedPubKey)[0:4])
-
-function toEosPublicKey(compressedPubKeyBuf) {
-  const checksum = crypto.createHash("ripemd160")
-    .update(compressedPubKeyBuf)
-    .digest()
-    .slice(0, 4);
-  return "EOS" + base58Encode(Buffer.concat([compressedPubKeyBuf, checksum]));
-}
-
 // ─── Derive keypair from BIP39 mnemonic ──────────────────────────────────────
+// Uses eosjs PrivateKey so the public key format matches what eosjs uses for signing
 
 export async function deriveKeypairFromMnemonic(mnemonic) {
   const seed  = await bip39.mnemonicToSeed(mnemonic);
   const hd    = HDKey.fromMasterSeed(seed);
   const child = hd.derive(DERIVATION_PATH);
 
-  const wif    = toWif(child.privateKey);
-  const pubKey = toEosPublicKey(child.publicKey);
+  // Convert raw private key buffer to WIF manually
+  const wif = toWif(child.privateKey);
+
+  // Use eosjs to get the public key — guarantees format matches signing
+  const { PrivateKey } = await import("eosjs/dist/eosjs-jssig.js");
+  const privKey = PrivateKey.fromString(wif);
+  const pubKey  = privKey.getPublicKey().toString(); // returns PUB_K1_... format
 
   return { wif, pubKey };
 }
@@ -97,19 +91,41 @@ export function isValidXprName(name) {
   return /^[a-z1-5.]+$/.test(name);
 }
 
+// ─── Check if account exists on-chain ────────────────────────────────────────
+
+async function accountExistsOnChain(accountName) {
+  try {
+    const res = await fetch("https://api.protonnz.com/v1/chain/get_account", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ account_name: accountName }),
+      signal:  AbortSignal.timeout(6000),
+    });
+    return res.ok; // 200 = exists, 404 = doesn't exist
+  } catch {
+    return false;
+  }
+}
+
 // ─── Wallet creation ──────────────────────────────────────────────────────────
 
 export async function createWallet(userId, accountName) {
   const col = await getMongoCollection("wallets");
 
+  // Check if this user already has a wallet
   const existing = await col.findOne({ userId: String(userId) });
   if (existing) return { exists: true, accountName: existing.accountName };
 
-  const nameExists = await col.findOne({ accountName });
-  if (nameExists) return { exists: false, nameTaken: true };
+  // Check local DB for name conflict
+  const nameInDb = await col.findOne({ accountName });
+  if (nameInDb) return { exists: false, nameTaken: true };
+
+  // Check on-chain — name may already exist on blockchain
+  const onChain = await accountExistsOnChain(accountName);
+  if (onChain) return { exists: false, nameTaken: true, onChain: true };
 
   // Generate mnemonic and derive keys
-  const mnemonic       = bip39.generateMnemonic(128);
+  const mnemonic        = bip39.generateMnemonic(128);
   const { wif, pubKey } = await deriveKeypairFromMnemonic(mnemonic);
 
   // Store encrypted key

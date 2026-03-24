@@ -57,7 +57,7 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
 
   const result = await api.transact({
     actions: [
-      // Create the account
+      // 1. Create the account
       {
         account:       "eosio",
         name:          "newaccount",
@@ -79,7 +79,7 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
           },
         },
       },
-      // Buy RAM for the new account (4096 bytes = enough for basic account)
+      // 2. Buy RAM (4096 bytes — enough for basic account + token balances)
       {
         account:       "eosio",
         name:          "buyrambytes",
@@ -88,6 +88,19 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
           payer:    MASTER_ACCOUNT,
           receiver: newAccountName,
           bytes:    4096,
+        },
+      },
+      // 3. Stake NET and CPU so account can transact
+      {
+        account:       "eosio",
+        name:          "delegatebw",
+        authorization: [{ actor: MASTER_ACCOUNT, permission: "active" }],
+        data: {
+          from:               MASTER_ACCOUNT,
+          receiver:           newAccountName,
+          stake_net_quantity: "1.0000 XPR",
+          stake_cpu_quantity: "1.0000 XPR",
+          transfer:           true,   // transfer ownership to new account
         },
       },
     ],
@@ -99,7 +112,29 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
   return result;
 }
 
-// ─── Get XPR balance ──────────────────────────────────────────────────────────
+// ─── Stake resources for an existing account ─────────────────────────────────
+// Used to fix accounts created before staking was added
+
+export async function stakeResources(accountName) {
+  if (!MASTER_ACCOUNT || !MASTER_KEY) {
+    throw new Error("MASTER_ACCOUNT or MASTER_PRIVATE_KEY not set in .env");
+  }
+  const api = getApi(MASTER_KEY);
+  return api.transact({
+    actions: [{
+      account:       "eosio",
+      name:          "delegatebw",
+      authorization: [{ actor: MASTER_ACCOUNT, permission: "active" }],
+      data: {
+        from:               MASTER_ACCOUNT,
+        receiver:           accountName,
+        stake_net_quantity: "1.0000 XPR",
+        stake_cpu_quantity: "1.0000 XPR",
+        transfer:           true,
+      },
+    }],
+  }, { blocksBehind: 3, expireSeconds: 30 });
+}
 
 export async function getXprBalance(accountName) {
   try {

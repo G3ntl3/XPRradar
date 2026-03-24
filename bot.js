@@ -6,7 +6,7 @@ import { saveSnapshot, getSnapshot, getUserSnapshots } from "./snapshots.js";
 import { generatePnlCard } from "./pnlCard.js";
 import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSubscribedToLaunches, registerAutoBuyHandler } from "./launchNotifier.js";
 import { createWallet, getWallet, updateWalletSettings, isValidXprName } from "./wallet.js";
-import { buyTokens, sellTokens, getXprBalance, getTokenBalance } from "./trader.js";
+import { buyTokens, sellTokens, getXprBalance, getTokenBalance, stakeResources } from "./trader.js";
 import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition } from "./positions.js";
 import { startPositionMonitor, autoBuyNewToken } from "./autoTrader.js";
 
@@ -815,6 +815,27 @@ bot.command("launch", async (ctx) => {
 bot.command("wallet", async (ctx) => {
   const arg = ctx.match?.trim().toLowerCase();
 
+  // /wallet fix — stake resources for existing wallet
+  if (arg === "fix") {
+    const wallet = await getWallet(ctx.from.id);
+    if (!wallet) return ctx.reply("❌ No wallet found. Use /wallet create &lt;name&gt; first.");
+    const loading = await ctx.reply(`⏳ Staking resources for <code>${wallet.accountName}</code>…`, { parse_mode: "HTML" });
+    try {
+      await stakeResources(wallet.accountName);
+      await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
+        `✅ <b>Resources staked!</b>\n\n` +
+        `Account <code>${wallet.accountName}</code> now has NET and CPU bandwidth.\n` +
+        `You can now execute trades.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (e) {
+      await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
+        `❌ Staking failed: ${e.message}`
+      ).catch(() => {});
+    }
+    return;
+  }
+
   // /wallet address
   if (arg === "address") {
     const wallet = await getWallet(ctx.from.id);
@@ -878,7 +899,7 @@ bot.command("wallet", async (ctx) => {
 
       if (result.nameTaken) {
         await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-          `❌ Account name <code>${chosenName}</code> is already taken.\n\nTry another name: /wallet create <name>`,
+          `❌ <b>Name taken</b>\n\n${result.onChain ? `<code>${chosenName}</code> already exists on XPR Network.` : `<code>${chosenName}</code> is already used in this bot.`}\n\nTry: /wallet create &lt;name&gt;`,
           { parse_mode: "HTML" }
         );
         return;
@@ -1166,7 +1187,6 @@ bot.command("quote", async (ctx) => {
 bot.command("buy", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
   if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
-  if (!wallet.accountCreated) return ctx.reply("❌ Wallet not yet registered on-chain.");
 
   const parts   = ctx.match?.trim().toUpperCase().split(/\s+/);
   const symbol  = parts?.[0];
