@@ -98,8 +98,8 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
         data: {
           from:               MASTER_ACCOUNT,
           receiver:           newAccountName,
-          stake_net_quantity: "1.0000 XPR",
-          stake_cpu_quantity: "1.0000 XPR",
+          stake_net_quantity: "1.0000 SYS",
+          stake_cpu_quantity: "1.0000 SYS",
           transfer:           true,   // transfer ownership to new account
         },
       },
@@ -128,8 +128,8 @@ export async function stakeResources(accountName) {
       data: {
         from:               MASTER_ACCOUNT,
         receiver:           accountName,
-        stake_net_quantity: "1.0000 XPR",
-        stake_cpu_quantity: "1.0000 XPR",
+        stake_net_quantity: "1.0000 SYS",
+        stake_cpu_quantity: "1.0000 SYS",
         transfer:           true,
       },
     }],
