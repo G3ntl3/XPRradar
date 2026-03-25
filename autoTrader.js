@@ -53,8 +53,10 @@ async function executeBuy(bot, user, token) {
   const balance = await getXprBalance(accountName);
   if (balance < autoBuyXpr) {
     await bot.api.sendMessage(Number(userId),
-      `⚠️ Insufficient balance for auto-buy of <b>${token.symbol}</b>\n` +
-      `Need: <code>${autoBuyXpr} XPR</code> | Have: <code>${balance.toFixed(4)} XPR</code>\n\n` +
+      `⚠️ <b>Insufficient balance</b> for auto-buy of <b>${token.symbol}</b>\n\n` +
+      `📬 Account: <code>${accountName}</code>\n` +
+      `💰 Balance: <code>${balance.toFixed(4)} XPR</code>\n` +
+      `📉 Need:    <code>${autoBuyXpr} XPR</code>\n\n` +
       `Fund your wallet to enable auto-trading.`,
       { parse_mode: "HTML" }
     ).catch(() => {});
@@ -134,7 +136,7 @@ async function monitorPositions(bot) {
       }
 
       // Stop-loss: down 60% from entry
-      if (xMultiple > 0 && xMultiple <= 0.4) {
+      if (xMultiple > 0 && xMultiple <= 0.2) {
         console.log(`🛑 Stop-loss triggered: ${pos.symbol} at ${xMultiple.toFixed(2)}x`);
         await executeSell(bot, pos, token, currentMcap, xMultiple, true);
         continue;

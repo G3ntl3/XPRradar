@@ -54,7 +54,7 @@ class JsonCollection {
     return docs.find(d => matchesFilter(d, filter)) ?? null;
   }
 
-  async find(filter = {}) {
+  find(filter = {}) {
     const docs = readCollection(this.name);
     const results = docs.filter(d => matchesFilter(d, filter));
     return {

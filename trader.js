@@ -4,13 +4,14 @@
  * Buy:  transfer XPR to simplelaunch with memo "buy:<tokenId>"
  * Sell: { seller, tokenId, tokenAmount, minXpr }
  *
+ * RPC FALLBACK: api.protonnz.com times out intermittently.
+ * We maintain a list of fallback endpoints and try each in order.
+ *
  * BONDING CURVE BALANCES — confirmed from contract ABI:
  *   table:  "holdings"
  *   struct: Holding { tokenId: uint64, amount: uint64 }
- *   scope:  accountName  (e.g. "gentle3")
- *
- * Query scope=accountName, find row where tokenId matches.
- * amount is raw uint64 with 4 decimal places: 464109971 → 46410.9971
+ *   scope:  accountName
+ *   amount is raw uint64 / 10000 = float tokens
  */
 
 import { Api, JsonRpc } from "eosjs";
@@ -18,21 +19,77 @@ import { JsSignatureProvider } from "eosjs/dist/eosjs-jssig.js";
 import fetch from "node-fetch";
 import { getPrivateKey } from "./wallet.js";
 
-const RPC_ENDPOINT     = "https://api.protonnz.com";
-const INDEXER_ENDPOINT = "https://mainnet-api.xprdata.org";
-const CONTRACT         = "simplelaunch";
-const XPR_CONTRACT     = "eosio.token";
-const XPR_SYMBOL       = "XPR";
-const XPR_DECIMALS     = 4;
-const MASTER_ACCOUNT   = process.env.MASTER_ACCOUNT;
-const MASTER_KEY       = process.env.MASTER_PRIVATE_KEY;
+// ─── RPC endpoints — tried in order, first success wins ──────────────────────
+const RPC_ENDPOINTS = [
+  "https://api.protonnz.com",
+  "https://mainnet-api.xprdata.org",
+  "https://proton.eosusa.io",
+  "https://proton.greymass.com",
+];
 
-function getRpc() {
-  return new JsonRpc(RPC_ENDPOINT, { fetch });
+const CONTRACT      = "simplelaunch";
+const XPR_CONTRACT  = "eosio.token";
+const XPR_SYMBOL    = "XPR";
+const XPR_DECIMALS  = 4;
+const MASTER_ACCOUNT = process.env.MASTER_ACCOUNT;
+const MASTER_KEY     = process.env.MASTER_PRIVATE_KEY;
+
+// ─── Resilient fetch — tries each RPC endpoint until one works ───────────────
+
+async function rpcPost(path, body, timeoutMs = 8000) {
+  let lastError;
+  for (const base of RPC_ENDPOINTS) {
+    try {
+      const res = await fetch(`${base}${path}`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(body),
+        signal:  AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) {
+        lastError = new Error(`HTTP ${res.status} from ${base}`);
+        continue;
+      }
+      return await res.json();
+    } catch (e) {
+      console.warn(`RPC ${base}${path} failed: ${e.message}`);
+      lastError = e;
+    }
+  }
+  throw lastError ?? new Error("All RPC endpoints failed");
 }
 
-function getApi(privateKeyWif) {
-  const rpc = getRpc();
+// ─── Get a working JsonRpc instance — tries each endpoint ────────────────────
+
+async function getWorkingRpc() {
+  for (const base of RPC_ENDPOINTS) {
+    try {
+      const rpc = new JsonRpc(base, { fetch });
+      await rpc.get_info(); // quick connectivity check
+      return rpc;
+    } catch (e) {
+      console.warn(`RPC endpoint ${base} unavailable: ${e.message}`);
+    }
+  }
+  // Last resort — return first endpoint even if it timed out (may recover)
+  return new JsonRpc(RPC_ENDPOINTS[0], { fetch });
+}
+
+// ─── Get a working eosjs Api instance ────────────────────────────────────────
+
+async function getWorkingApi(privateKeyWif) {
+  for (const base of RPC_ENDPOINTS) {
+    try {
+      const rpc = new JsonRpc(base, { fetch });
+      await rpc.get_info();
+      const sig = new JsSignatureProvider([privateKeyWif]);
+      return new Api({ rpc, signatureProvider: sig, textEncoder: new TextEncoder(), textDecoder: new TextDecoder() });
+    } catch (e) {
+      console.warn(`API endpoint ${base} unavailable: ${e.message}`);
+    }
+  }
+  // Fallback — use first endpoint
+  const rpc = new JsonRpc(RPC_ENDPOINTS[0], { fetch });
   const sig = new JsSignatureProvider([privateKeyWif]);
   return new Api({ rpc, signatureProvider: sig, textEncoder: new TextEncoder(), textDecoder: new TextDecoder() });
 }
@@ -62,15 +119,11 @@ export function extractEosError(e) {
 
 export async function getXprBalance(accountName) {
   try {
-    const res = await fetch(`${RPC_ENDPOINT}/v1/chain/get_currency_balance`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ code: XPR_CONTRACT, account: accountName, symbol: XPR_SYMBOL }),
-      signal:  AbortSignal.timeout(8000),
+    const data = await rpcPost("/v1/chain/get_currency_balance", {
+      code: XPR_CONTRACT, account: accountName, symbol: XPR_SYMBOL,
     });
-    const rows = await res.json();
-    if (!Array.isArray(rows) || !rows.length) return 0;
-    return parseFloat(rows[0].split(" ")[0]);
+    if (!Array.isArray(data) || !data.length) return 0;
+    return parseFloat(data[0].split(" ")[0]);
   } catch (e) {
     console.warn("getXprBalance error:", e.message);
     return 0;
@@ -79,80 +132,50 @@ export async function getXprBalance(accountName) {
 
 // ─── Bonding curve token balance ─────────────────────────────────────────────
 // Table: "holdings", scope: accountName, struct: { tokenId, amount }
-// amount is raw uint64 with 4 decimal places.
 
 export async function getBondingBalance(accountName, tokenId) {
-  const endpoints = [RPC_ENDPOINT, INDEXER_ENDPOINT];
+  try {
+    const data = await rpcPost("/v1/chain/get_table_rows", {
+      code:  CONTRACT,
+      scope: accountName,
+      table: "holdings",
+      json:  true,
+      limit: 100,
+    });
 
-  for (const endpoint of endpoints) {
-    try {
-      const res = await fetch(`${endpoint}/v1/chain/get_table_rows`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code:  CONTRACT,
-          scope: accountName,      // scope = account name
-          table: "holdings",       // correct table name from ABI
-          json:  true,
-          limit: 100,
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
+    const rows = data?.rows ?? [];
+    console.log(`getBondingBalance: account=${accountName} rows=${rows.length}`, JSON.stringify(rows));
 
-      if (!res.ok) {
-        console.warn(`getBondingBalance [${endpoint}]: HTTP ${res.status}`);
-        continue;
-      }
+    const row = rows.find(r => String(r.tokenId) === String(tokenId));
+    if (!row) return 0;
 
-      const data = await res.json();
-      const rows = data?.rows ?? [];
+    const amount = row.amount / 10000;
+    console.log(`getBondingBalance: found ${amount} (raw: ${row.amount}) tokenId=${tokenId}`);
+    return amount;
 
-      console.log(`getBondingBalance [${endpoint}]: account=${accountName} rows=${rows.length}`, JSON.stringify(rows));
-
-      const row = rows.find(r => String(r.tokenId) === String(tokenId));
-      if (!row) {
-        if (rows.length) console.log(`getBondingBalance: tokenId ${tokenId} not found. Holdings:`, JSON.stringify(rows));
-        continue;
-      }
-
-      // amount is raw integer / 10000
-      const amount = row.amount / 10000;
-      console.log(`getBondingBalance: found ${amount} (raw: ${row.amount}) for ${accountName} tokenId=${tokenId}`);
-      return amount;
-
-    } catch (e) {
-      console.warn(`getBondingBalance [${endpoint}] error:`, e.message);
-    }
+  } catch (e) {
+    console.warn("getBondingBalance error:", e.message);
+    return 0;
   }
-
-  console.log(`getBondingBalance: no holdings for account=${accountName} tokenId=${tokenId}`);
-  return 0;
 }
 
 // ─── All bonding holdings for an account ─────────────────────────────────────
-// Returns array of { tokenId, amount } for all tokens held on the bonding curve
 
 export async function getAllHoldings(accountName) {
   try {
-    const res = await fetch(`${RPC_ENDPOINT}/v1/chain/get_table_rows`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        code:  CONTRACT,
-        scope: accountName,
-        table: "holdings",
-        json:  true,
-        limit: 100,
-      }),
-      signal: AbortSignal.timeout(8000),
+    const data = await rpcPost("/v1/chain/get_table_rows", {
+      code:  CONTRACT,
+      scope: accountName,
+      table: "holdings",
+      json:  true,
+      limit: 100,
     });
-    if (!res.ok) return [];
-    const data = await res.json();
     return (data?.rows ?? []).map(r => ({
       tokenId: r.tokenId,
       amount:  r.amount / 10000,
     }));
-  } catch {
+  } catch (e) {
+    console.warn("getAllHoldings error:", e.message);
     return [];
   }
 }
@@ -165,7 +188,7 @@ export async function getTokenBalance(accountName, symbol, tokenId = null, contr
       const bondingAmt = await getBondingBalance(accountName, tokenId);
       if (bondingAmt > 0) return bondingAmt;
     }
-    const rpc  = getRpc();
+    const rpc  = await getWorkingRpc();
     const rows = await rpc.get_currency_balance(contract, accountName, symbol).catch(() => []);
     if (rows?.length) return parseFloat(rows[0].split(" ")[0]);
     return 0;
@@ -178,7 +201,7 @@ export async function buyTokens({ userId, accountName, tokenId, xprAmount }) {
   const privateKey = await getPrivateKey(userId);
   if (!privateKey) throw new Error("No wallet found for user");
 
-  const api = getApi(privateKey);
+  const api = await getWorkingApi(privateKey);
   try {
     return await api.transact({
       actions: [{
@@ -205,7 +228,7 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
   const privateKey = await getPrivateKey(userId);
   if (!privateKey) throw new Error("No wallet found for user");
 
-  // Step 1: Live holdings table balance (most reliable)
+  // Step 1: Live holdings table balance
   let amount = 0;
   if (tokenId != null) amount = await getBondingBalance(accountName, tokenId);
 
@@ -214,8 +237,11 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
 
   // Step 3: eosio.token fallback for graduated tokens
   if (!amount && symbol) {
-    const rows = await getRpc().get_currency_balance("eosio.token", accountName, symbol).catch(() => []);
-    if (rows?.length) amount = parseFloat(rows[0].split(" ")[0]);
+    try {
+      const rpc  = await getWorkingRpc();
+      const rows = await rpc.get_currency_balance("eosio.token", accountName, symbol).catch(() => []);
+      if (rows?.length) amount = parseFloat(rows[0].split(" ")[0]);
+    } catch {}
   }
 
   if (!amount || amount <= 0) throw new Error("No token balance to sell");
@@ -223,7 +249,7 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
   const rawAmount = rawTokenAmount(amount, precision);
   console.log(`sellTokens: ${amount} ${symbol ?? ""} (raw: ${rawAmount}) tokenId=${tokenId}`);
 
-  const api = getApi(privateKey);
+  const api = await getWorkingApi(privateKey);
   try {
     return await api.transact({
       actions: [{
@@ -243,7 +269,7 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
 
 export async function createXprAccount(newAccountName, ownerPublicKey) {
   if (!MASTER_ACCOUNT || !MASTER_KEY) throw new Error("MASTER_ACCOUNT or MASTER_PRIVATE_KEY not set in .env");
-  const api = getApi(MASTER_KEY);
+  const api = await getWorkingApi(MASTER_KEY);
   return api.transact({
     actions: [
       {
@@ -271,7 +297,7 @@ export async function createXprAccount(newAccountName, ownerPublicKey) {
 
 export async function stakeResources(accountName) {
   if (!MASTER_ACCOUNT || !MASTER_KEY) throw new Error("MASTER_ACCOUNT or MASTER_PRIVATE_KEY not set in .env");
-  const api = getApi(MASTER_KEY);
+  const api = await getWorkingApi(MASTER_KEY);
   return api.transact({
     actions: [{
       account: "eosio", name: "delegatebw",
@@ -284,7 +310,8 @@ export async function stakeResources(accountName) {
 export async function getAllBalances(accountName) {
   try {
     const xpr     = await getXprBalance(accountName);
-    const account = await getRpc().get_account(accountName).catch(() => null);
+    const rpc     = await getWorkingRpc();
+    const account = await rpc.get_account(accountName).catch(() => null);
     return { xpr, account };
   } catch (e) {
     console.warn("getAllBalances error:", e.message);

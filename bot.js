@@ -884,11 +884,13 @@ bot.command("wallet", async (ctx) => {
       );
     }
 
+    // Basic sanity check — eosjs does the real cryptographic validation
     if (!isValidPrivateKey(privateKey)) {
       await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
       return ctx.reply(
         `❌ <b>Invalid private key format.</b>\n\n` +
-        `Expected: <code>5K...</code> (WIF format) or <code>PVT_K1_...</code> (WebAuth format)\n\n` +
+        `Expected a key starting with <code>5</code> (WIF) or <code>PVT_K1_</code> (WebAuth).\n\n` +
+        `Go to WebAuth → Settings → Backup Wallet → Show Private Key to get your key.\n\n` +
         `Your message has been deleted for security.`,
         { parse_mode: "HTML" }
       );
