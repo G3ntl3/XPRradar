@@ -1,15 +1,17 @@
 /**
- * Wallet Manager
- * Uses eosjs PrivateKey/PublicKey classes for correct EOSIO key handling
- * BIP44 derivation path m/44'/194'/0'/0/0 (EOSIO coin type 194)
+ * Wallet Manager — Import Mode
+ * Accepts both WIF (5K...) and PVT_K1_... private key formats.
+ * eosjs handles both natively via PrivateKey.fromString().
+ *
+ * KEY VERIFICATION FIX:
+ * EOS-prefixed keys (stored on-chain) use a different checksum than PUB_K1_ keys.
+ * So we derive BOTH formats from the private key and compare against either.
+ * - pub.toString()       → PUB_K1_...  (modern format)
+ * - pub.toLegacyString() → EOS...      (legacy format, matches what chain stores)
  */
 
 import crypto from "crypto";
-import * as bip39 from "bip39";
-import HDKey from "hdkey";
 import { getMongoCollection } from "./db.js";
-
-const DERIVATION_PATH = "m/44'/194'/0'/0/0";
 
 // ─── Encryption ───────────────────────────────────────────────────────────────
 
@@ -36,127 +38,151 @@ export function decryptKey(text) {
   ]).toString();
 }
 
-// ─── Base58 ───────────────────────────────────────────────────────────────────
+// ─── Validate private key format ──────────────────────────────────────────────
+// Accepts: WIF (5K...) OR PVT_K1_... (modern Antelope format from WebAuth)
 
-const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-function base58Encode(buf) {
-  let num = BigInt("0x" + buf.toString("hex"));
-  let str = "";
-  while (num > 0n) {
-    str = BASE58[Number(num % 58n)] + str;
-    num /= 58n;
-  }
-  for (const b of buf) {
-    if (b !== 0) break;
-    str = "1" + str;
-  }
-  return str;
+export function isValidPrivateKey(key) {
+  if (!key) return false;
+  const k = key.trim();
+  if (/^5[HJK][1-9A-HJ-NP-Za-km-z]{49}$/.test(k)) return true;
+  if (/^PVT_K1_[1-9A-HJ-NP-Za-km-z]{50,}$/.test(k)) return true;
+  return false;
 }
 
-// ─── EOSIO WIF private key ────────────────────────────────────────────────────
+// ─── Derive public key — both formats ────────────────────────────────────────
+// Returns pubKeyK1 (PUB_K1_...) and pubKeyEOS (EOS...) from a private key.
+// The chain stores EOS format; toLegacyString() produces the correct checksum.
 
-function toWif(privKeyBuf) {
-  const payload  = Buffer.concat([Buffer.from([0x80]), privKeyBuf]);
-  const h1       = crypto.createHash("sha256").update(payload).digest();
-  const h2       = crypto.createHash("sha256").update(h1).digest();
-  const checksum = h2.slice(0, 4);
-  return base58Encode(Buffer.concat([payload, checksum]));
-}
-
-// ─── Derive keypair from BIP39 mnemonic ──────────────────────────────────────
-// Uses eosjs PrivateKey so the public key format matches what eosjs uses for signing
-
-export async function deriveKeypairFromMnemonic(mnemonic) {
-  const seed  = await bip39.mnemonicToSeed(mnemonic);
-  const hd    = HDKey.fromMasterSeed(seed);
-  const child = hd.derive(DERIVATION_PATH);
-
-  // Convert raw private key buffer to WIF manually
-  const wif = toWif(child.privateKey);
-
-  // Use eosjs to get the public key — guarantees format matches signing
+export async function getPublicKeyFromPrivate(privateKey) {
   const { PrivateKey } = await import("eosjs/dist/eosjs-jssig.js");
-  const privKey = PrivateKey.fromString(wif);
-  const pubKey  = privKey.getPublicKey().toString(); // returns PUB_K1_... format
-
-  return { wif, pubKey };
+  const priv = PrivateKey.fromString(privateKey.trim());
+  const pub  = priv.getPublicKey();
+  return {
+    pubKeyK1:  pub.toString(),        // PUB_K1_...
+    pubKeyEOS: pub.toLegacyString(),  // EOS...  ← correct checksum for chain comparison
+  };
 }
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Verify key matches account on-chain ─────────────────────────────────────
 
-export function isValidXprName(name) {
-  if (!name) return false;
-  if (name.length < 3 || name.length > 12) return false;
-  return /^[a-z1-5.]+$/.test(name);
-}
-
-// ─── Check if account exists on-chain ────────────────────────────────────────
-
-async function accountExistsOnChain(accountName) {
+export async function verifyKeyMatchesAccount(privateKey, accountName) {
   try {
+    const { pubKeyK1, pubKeyEOS } = await getPublicKeyFromPrivate(privateKey);
+
+    console.log("Derived PUB_K1_:", pubKeyK1);
+    console.log("Derived EOS:    ", pubKeyEOS);
+
     const res = await fetch("https://api.protonnz.com/v1/chain/get_account", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({ account_name: accountName }),
-      signal:  AbortSignal.timeout(6000),
+      signal:  AbortSignal.timeout(8000),
     });
-    return res.ok; // 200 = exists, 404 = doesn't exist
-  } catch {
-    return false;
+
+    if (!res.ok) {
+      return { valid: false, error: `Account "${accountName}" not found on XPR Network` };
+    }
+
+    const data = await res.json();
+
+    // Collect all keys from all permissions
+    const chainKeys = [];
+    for (const perm of data.permissions ?? []) {
+      for (const k of perm.required_auth?.keys ?? []) {
+        chainKeys.push(k.key);
+      }
+    }
+
+    console.log("Chain keys:", chainKeys);
+
+    // Compare full key strings against BOTH derived formats.
+    // EOS and PUB_K1_ have different checksums so we must compare full strings.
+    const match = chainKeys.some(chainKey =>
+      chainKey === pubKeyEOS || chainKey === pubKeyK1
+    );
+
+    if (!match) {
+      return {
+        valid:  false,
+        error:  `Private key does not match any key on account "${accountName}".\n` +
+                `Derived: ${pubKeyEOS}\nChain keys: ${chainKeys.join(", ")}`,
+        chainKeys,
+      };
+    }
+
+    // Store EOS format as canonical — matches what chain shows
+    return { valid: true, pubKey: pubKeyEOS, accountName };
+
+  } catch (e) {
+    return { valid: false, error: `Verification error: ${e.message}` };
   }
 }
 
-// ─── Wallet creation ──────────────────────────────────────────────────────────
+// ─── Find account by key ──────────────────────────────────────────────────────
+// Looks up which account a private key belongs to — used for auto-detect on import
 
-export async function createWallet(userId, accountName) {
+export async function findAccountByKey(privateKey) {
+  try {
+    const { pubKeyK1, pubKeyEOS } = await getPublicKeyFromPrivate(privateKey);
+
+    // Try both key formats
+    for (const pubKey of [pubKeyEOS, pubKeyK1]) {
+      const res = await fetch("https://api.protonnz.com/v1/chain/get_accounts_by_authorizers", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ accounts: [], keys: [pubKey] }),
+        signal:  AbortSignal.timeout(8000),
+      });
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.accounts?.length > 0) {
+        return data.accounts[0].account_name;
+      }
+    }
+
+    return null;
+  } catch (e) {
+    console.error("findAccountByKey error:", e.message);
+    return null;
+  }
+}
+
+// ─── Import wallet ────────────────────────────────────────────────────────────
+
+export async function importWallet(userId, privateKey, accountName) {
   const col = await getMongoCollection("wallets");
 
-  // Check if this user already has a wallet
   const existing = await col.findOne({ userId: String(userId) });
-  if (existing) return { exists: true, accountName: existing.accountName };
+  if (existing) return { error: "already_exists", accountName: existing.accountName };
 
-  // Check local DB for name conflict
-  const nameInDb = await col.findOne({ accountName });
-  if (nameInDb) return { exists: false, nameTaken: true };
+  const verification = await verifyKeyMatchesAccount(privateKey, accountName);
+  if (!verification.valid) return { error: "key_mismatch", message: verification.error };
 
-  // Check on-chain — name may already exist on blockchain
-  const onChain = await accountExistsOnChain(accountName);
-  if (onChain) return { exists: false, nameTaken: true, onChain: true };
-
-  // Generate mnemonic and derive keys
-  const mnemonic        = bip39.generateMnemonic(128);
-  const { wif, pubKey } = await deriveKeypairFromMnemonic(mnemonic);
-
-  // Store encrypted key
   await col.insertOne({
     userId:          String(userId),
     accountName,
-    publicKey:       pubKey,
-    privateKeyEnc:   encryptKey(wif),
-    createdAt:       new Date(),
-    accountCreated:  false,
+    publicKey:       verification.pubKey,
+    privateKeyEnc:   encryptKey(privateKey.trim()),
+    importedAt:      new Date(),
+    accountCreated:  true,
     autoBuyXpr:      5,
     autoSellX:       3,
     autoBuyEnabled:  false,
     autoSellEnabled: false,
   });
 
-  // Create on-chain
-  let accountCreated = false;
-  let creationError  = null;
-  try {
-    const { createXprAccount } = await import("./trader.js");
-    await createXprAccount(accountName, pubKey);
-    accountCreated = true;
-    await col.updateOne({ userId: String(userId) }, { $set: { accountCreated: true } });
-  } catch (e) {
-    creationError = e.message;
-    console.error("On-chain account creation failed:", e.message);
-  }
-
-  return { exists: false, nameTaken: false, mnemonic, publicKey: pubKey, accountName, accountCreated, creationError };
+  return { success: true, accountName, pubKey: verification.pubKey };
 }
+
+// ─── Remove wallet ────────────────────────────────────────────────────────────
+
+export async function removeWallet(userId) {
+  const col = await getMongoCollection("wallets");
+  await col.deleteOne({ userId: String(userId) });
+}
+
+// ─── Standard getters ─────────────────────────────────────────────────────────
 
 export async function getWallet(userId) {
   const col = await getMongoCollection("wallets");
@@ -175,7 +201,7 @@ export async function updateWalletSettings(userId, settings) {
 }
 
 export async function getAllActiveAutobuyers() {
-  const col = await getMongoCollection("wallets");
+  const col    = await getMongoCollection("wallets");
   const result = await col.find({ autoBuyEnabled: true });
   return result.toArray();
 }

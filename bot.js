@@ -5,10 +5,11 @@ import { runDevCheck } from "./devcheck.js";
 import { saveSnapshot, getSnapshot, getUserSnapshots } from "./snapshots.js";
 import { generatePnlCard } from "./pnlCard.js";
 import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSubscribedToLaunches, registerAutoBuyHandler } from "./launchNotifier.js";
-import { createWallet, getWallet, updateWalletSettings, isValidXprName } from "./wallet.js";
-import { buyTokens, sellTokens, getXprBalance, getTokenBalance, stakeResources } from "./trader.js";
+import { importWallet, getWallet, updateWalletSettings, removeWallet, isValidPrivateKey } from "./wallet.js";
+import { buyTokens, sellTokens, getXprBalance, getTokenBalance, getBondingBalance, getAllHoldings } from "./trader.js";
 import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition } from "./positions.js";
 import { startPositionMonitor, autoBuyNewToken } from "./autoTrader.js";
+import { startDepositMonitor } from "./depositMonitor.js";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN in .env");
@@ -71,10 +72,7 @@ function timeSince(ts) {
   return `${Math.floor(secs / 86400)}d ago`;
 }
 
-// Graduation mcap target on SimpleDEX
-// Based on observed data: KARMA graduated at ~$264 mcap, MOTHER at $234 is still on-curve
-// The bonding curve target appears to be ~$300 USD mcap
-// bondingBar is now async — fetches real on-chain progress
+// bondingBar is async — fetches real on-chain progress
 async function bondingBar(token) {
   if (token.graduated) {
     return `🎓 <b>Graduated</b>\n   <code>████████████████████</code> 100%`;
@@ -107,7 +105,6 @@ async function bondingBar(token) {
     }
   }
 
-  // Fallback — show just graduated status
   return `📈 <b>On Curve</b> — progress unavailable`;
 }
 
@@ -136,7 +133,7 @@ bot.command("start", async (ctx) => {
     `/launch — New token launch notifications\n` +
     `/launch stop — Unsubscribe\n\n` +
     `<b>💰 Trading Wallet</b>\n` +
-    `/wallet create &lt;name&gt; — Create trading wallet\n` +
+    `/wallet import &lt;key&gt; &lt;account&gt; — Connect WebAuth wallet\n` +
     `/wallet address — Show deposit address\n` +
     `/balance — XPR balance + positions\n` +
     `/buy &lt;SYMBOL&gt; &lt;amount&gt; — Buy tokens (e.g. /buy MARSH 5)\n` +
@@ -177,7 +174,7 @@ bot.command("help", async (ctx) => {
     `/launch stop — Unsubscribe\n\n` +
 
     `<b>💰 Trading Wallet</b>\n` +
-    `/wallet create &lt;name&gt; — Create your XPR trading wallet\n` +
+    `/wallet import &lt;key&gt; &lt;account&gt; — Connect your WebAuth wallet\n` +
     `/wallet — Show wallet status\n` +
     `/wallet address — Show deposit address\n` +
     `/balance — XPR balance, positions, settings\n\n` +
@@ -203,7 +200,6 @@ bot.command("help", async (ctx) => {
 });
 
 // ─── Shared: build token message ─────────────────────────────────────────────
-// Extracted so both /token command AND refresh callback use identical output
 
 async function buildTokenMsg(symbol) {
   const t = await getToken(symbol);
@@ -286,7 +282,7 @@ bot.on("message:text", async (ctx, next) => {
   return next();
 });
 
-// ─── /token — Full metadata ───────────────────────────────────────────────────
+// ─── /token ───────────────────────────────────────────────────────────────────
 
 bot.command("token", async (ctx) => {
   const symbol = ctx.match?.trim().toUpperCase();
@@ -305,7 +301,6 @@ bot.command("token", async (ctx) => {
       return;
     }
 
-    // Auto-save price snapshot for /pnl tracking
     saveSnapshot(ctx.from.id, symbol, result.token.mcap ?? result.token.price);
 
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, {
@@ -337,7 +332,6 @@ bot.command("price", async (ctx) => {
     return;
   }
 
-  // Auto-save price snapshot for /pnl tracking
   saveSnapshot(ctx.from.id, symbol, t.mcap ?? t.price);
 
   const kb = new InlineKeyboard()
@@ -402,7 +396,6 @@ bot.command("holders", async (ctx) => {
     return;
   }
 
-  // Get supply for percentage calculation
   const tokenInfo = await getToken(symbol);
   const supply = tokenInfo?.circulatingSupply ?? tokenInfo?.supply ?? 0;
 
@@ -437,14 +430,12 @@ bot.command("tokens", async (ctx) => {
     return;
   }
 
-  // Telegram messages max 4096 chars — split into pages of 50
   const PAGE = 50;
   const pages = [];
   for (let i = 0; i < tokens.length; i += PAGE) {
     pages.push(tokens.slice(i, i + PAGE));
   }
 
-  // Send first page as edit of loading message
   const buildPage = (page, pageNum, total) => {
     let msg = `🪙 <b>SimpleDEX Tokens</b> (${total} total) — Page ${pageNum}/${pages.length}\n\n`;
     for (const t of page) {
@@ -461,7 +452,6 @@ bot.command("tokens", async (ctx) => {
     { parse_mode: "HTML" }
   );
 
-  // Send remaining pages as new messages
   for (let i = 1; i < pages.length; i++) {
     await ctx.reply(buildPage(pages[i], i + 1, count), { parse_mode: "HTML" });
   }
@@ -472,7 +462,6 @@ bot.command("tokens", async (ctx) => {
 bot.command("pnl", async (ctx) => {
   const symbol = ctx.match?.trim().toUpperCase();
 
-  // No symbol — show all tracked tokens
   if (!symbol) {
     const all = getUserSnapshots(ctx.from.id);
     const entries = Object.entries(all);
@@ -495,7 +484,6 @@ bot.command("pnl", async (ctx) => {
 
   const loading = await ctx.reply(`⏳ Calculating PNL for <b>${symbol}</b>…`, { parse_mode: "HTML" });
 
-  // Get saved snapshot
   const snap = getSnapshot(ctx.from.id, symbol);
   if (!snap) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
@@ -506,7 +494,6 @@ bot.command("pnl", async (ctx) => {
     return;
   }
 
-  // Get current mcap
   const t = await getToken(symbol);
   if (!t) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
@@ -515,15 +502,12 @@ bot.command("pnl", async (ctx) => {
     return;
   }
 
-  // mcapThen: what was stored at snapshot time
-  // If old snapshot stored price (tiny number < 1), use current mcap as fallback
   const storedVal = snap.price ?? 0;
   const mcapNow   = t.mcap ?? 0;
-  const mcapThen  = storedVal > 1 ? storedVal : mcapNow; // old price snapshots get current mcap
+  const mcapThen  = storedVal > 1 ? storedVal : mcapNow;
 
   const pctChange = mcapThen > 0 ? ((mcapNow - mcapThen) / mcapThen) * 100 : 0;
   const xChange   = mcapThen > 0 ? mcapNow / mcapThen : 1;
-  // Keep priceThen/priceNow for text fallback
   const priceThen = mcapThen;
   const priceNow  = mcapNow;
 
@@ -531,10 +515,8 @@ bot.command("pnl", async (ctx) => {
     .text("🔄 Update Snapshot", `price:${symbol}`)
     .text("📋 Token Info",      `token:${symbol}`);
 
-  // Delete the loading message first
   await ctx.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
 
-  // Try to generate the PNL card image
   try {
     const imageBuffer = await generatePnlCard({
       symbol,
@@ -552,7 +534,6 @@ bot.command("pnl", async (ctx) => {
     );
 
   } catch (imgErr) {
-    // canvas not installed yet — fall back to text
     console.warn("PNL card failed (canvas not installed?):", imgErr.message);
 
     const isUp  = priceNow >= priceThen;
@@ -610,7 +591,7 @@ bot.command("devcheck", async (ctx) => {
   }
 });
 
-// ─── buildDevCheckMsg helper (used by command + refresh button) ───────────────
+// ─── buildDevCheckMsg ─────────────────────────────────────────────────────────
 
 async function buildDevCheckMsg(symbol) {
   const r = await runDevCheck(symbol);
@@ -693,7 +674,6 @@ bot.on("callback_query:data", async (ctx) => {
   const [action, symbol] = ctx.callbackQuery.data.split(":");
 
   if (action === "token") {
-    // Refresh token message in place
     const result = await buildTokenMsg(symbol);
     if (!result) return ctx.answerCallbackQuery("Token not found");
     saveSnapshot(ctx.from.id, symbol, result.token.mcap ?? result.token.price);
@@ -753,7 +733,6 @@ bot.on("callback_query:data", async (ctx) => {
     await ctx.reply(msg, { parse_mode: "HTML" });
 
   } else if (action === "devcheck") {
-    // Use editMessageText to refresh in place
     await ctx.editMessageText(
       `⏳ Refreshing dev check for <b>${symbol}</b>…`, { parse_mode: "HTML" }
     ).catch(() => {});
@@ -769,7 +748,7 @@ bot.on("callback_query:data", async (ctx) => {
   }
 });
 
-// ─── /launch — subscribe to new token notifications ──────────────────────────
+// ─── /launch ──────────────────────────────────────────────────────────────────
 
 bot.command("launch", async (ctx) => {
   const arg = ctx.match?.trim().toLowerCase();
@@ -783,7 +762,6 @@ bot.command("launch", async (ctx) => {
     return;
   }
 
-  // Toggle — if already subscribed, show status
   if (isSubscribedToLaunches(ctx.chat.id)) {
     await ctx.reply(
       `✅ <b>Already subscribed to launch alerts!</b>\n\n` +
@@ -813,149 +791,161 @@ bot.command("launch", async (ctx) => {
 // ─── /wallet ──────────────────────────────────────────────────────────────────
 
 bot.command("wallet", async (ctx) => {
-  const arg = ctx.match?.trim().toLowerCase();
+  const arg    = ctx.match?.trim();
+  const argLow = arg?.toLowerCase();
 
-  // /wallet fix — stake resources for existing wallet
-  if (arg === "fix") {
+  if (!argLow || argLow === "status") {
     const wallet = await getWallet(ctx.from.id);
-    if (!wallet) return ctx.reply("❌ No wallet found. Use /wallet create &lt;name&gt; first.");
-    const loading = await ctx.reply(`⏳ Staking resources for <code>${wallet.accountName}</code>…`, { parse_mode: "HTML" });
-    try {
-      await stakeResources(wallet.accountName);
-      await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-        `✅ <b>Resources staked!</b>\n\n` +
-        `Account <code>${wallet.accountName}</code> now has NET and CPU bandwidth.\n` +
-        `You can now execute trades.`,
+    if (wallet) {
+      return ctx.reply(
+        `💼 <b>Your Trading Wallet</b>\n\n` +
+        `📬 Account: <code>${wallet.accountName}</code>\n` +
+        `🔑 Public Key: <code>${wallet.publicKey}</code>\n\n` +
+        `⚙️ Auto-buy:  ${wallet.autoBuyEnabled ? `✅ ${wallet.autoBuyXpr} XPR/trade` : "❌ Off"}\n` +
+        `⚙️ Auto-sell: ${wallet.autoSellEnabled ? `✅ ${wallet.autoSellX}x target` : "❌ Off"}\n\n` +
+        `/wallet address — deposit address\n` +
+        `/wallet remove — disconnect wallet\n` +
+        `/balance — check balance`,
         { parse_mode: "HTML" }
       );
-    } catch (e) {
-      await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-        `❌ Staking failed: ${e.message}`
-      ).catch(() => {});
     }
-    return;
+    return ctx.reply(
+      `👋 <b>XPR Radar Trading</b>\n\n` +
+      `Connect your existing WebAuth wallet to start trading.\n\n` +
+      `<b>Command:</b>\n` +
+      `<code>/wallet import &lt;privatekey&gt; &lt;accountname&gt;</code>\n\n` +
+      `<b>How to get your private key:</b>\n` +
+      `WebAuth → Settings → Backup Wallet → Show Private Key\n\n` +
+      `⚠️ <b>Recommended:</b> Create a dedicated trading account in WebAuth with only your trading budget.`,
+      { parse_mode: "HTML" }
+    );
   }
 
-  // /wallet address
-  if (arg === "address") {
+  if (argLow === "address") {
     const wallet = await getWallet(ctx.from.id);
-    if (!wallet) return ctx.reply("❌ No wallet found. Use /wallet create <name> first.");
+    if (!wallet) return ctx.reply("❌ No wallet connected. Use /wallet import first.");
     return ctx.reply(
-      `📬 <b>Your Trading Wallet</b>\n\n` +
+      `📬 <b>Trading Wallet Address</b>\n\n` +
       `Account: <code>${wallet.accountName}</code>\n\n` +
       `Send XPR to this account name to fund your trading.`,
       { parse_mode: "HTML" }
     );
   }
 
-  // /wallet create <name>
-  if (arg?.startsWith("create")) {
-    const parts       = arg.split(/\s+/);
-    const chosenName  = parts[1]?.toLowerCase();
+  if (argLow === "remove") {
+    const wallet = await getWallet(ctx.from.id);
+    if (!wallet) return ctx.reply("❌ No wallet connected.");
+    await removeWallet(ctx.from.id);
+    return ctx.reply(
+      `✅ <b>Wallet disconnected.</b>\n\n` +
+      `Account <code>${wallet.accountName}</code> removed from this bot.\n` +
+      `Your funds are safe — use WebAuth to access them.\n\n` +
+      `Use /wallet import to reconnect.`,
+      { parse_mode: "HTML" }
+    );
+  }
 
-    // Show usage if no name provided
-    if (!chosenName) {
+  if (argLow?.startsWith("import")) {
+    if (ctx.chat.type !== "private") {
       return ctx.reply(
-        `📝 <b>Choose your XPR account name</b>\n\n` +
-        `Rules:\n` +
-        `• 3–12 characters long\n` +
-        `• Only letters a-z and numbers 1-5\n` +
-        `• No spaces, no special characters\n\n` +
-        `Example: <code>/wallet create myname</code>\n` +
-        `Example: <code>/wallet create trader123</code> ❌ (contains 6-9)\n` +
-        `Example: <code>/wallet create trader12</code> ✅`,
+        `🔒 <b>Private chat only!</b>\n\n` +
+        `For security, wallet import must be done in a private chat with the bot.\n` +
+        `Open a private chat and send the command there.`,
         { parse_mode: "HTML" }
       );
     }
 
-    // Validate name
-    if (!isValidXprName(chosenName)) {
+    const parts       = arg.trim().split(/\s+/);
+    const privateKey  = parts[1];
+    const accountName = parts[2]?.toLowerCase();
+
+    if (!privateKey || !accountName) {
       return ctx.reply(
-        `❌ <b>Invalid account name: <code>${chosenName}</code></b>\n\n` +
-        `Rules:\n` +
-        `• 3–12 characters\n` +
-        `• Only: a-z and 1-5\n` +
-        `• No: 6 7 8 9 0 or special characters\n\n` +
-        `Try again: /wallet create <name>`,
+        `🔑 <b>Import Your WebAuth Wallet</b>\n\n` +
+        `<b>Usage:</b>\n` +
+        `<code>/wallet import &lt;privatekey&gt; &lt;accountname&gt;</code>\n\n` +
+        `<b>Example:</b>\n` +
+        `<code>/wallet import 5KxxxYourKey gentle2</code>\n\n` +
+        `<b>Get your private key:</b>\n` +
+        `WebAuth → Settings → Backup Wallet → Show Private Key\n\n` +
+        `⚠️ Your message will be <b>immediately deleted</b> after processing.\n` +
+        `⚠️ Use a dedicated trading account — not your main wallet.`,
         { parse_mode: "HTML" }
       );
     }
 
-    // Check existing wallet
     const existing = await getWallet(ctx.from.id);
     if (existing) {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
       return ctx.reply(
-        `✅ <b>You already have a wallet</b>\n\n` +
-        `📬 Account: <code>${existing.accountName}</code>\n\n` +
-        `Use /balance to check your balance.`,
+        `✅ You already have a wallet: <code>${existing.accountName}</code>\n\n` +
+        `Use /wallet remove first to disconnect it.`,
         { parse_mode: "HTML" }
       );
     }
 
-    const loading = await ctx.reply(`⏳ Creating wallet <code>${chosenName}</code>…`, { parse_mode: "HTML" });
+    if (!isValidPrivateKey(privateKey)) {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+      return ctx.reply(
+        `❌ <b>Invalid private key format.</b>\n\n` +
+        `Expected: <code>5K...</code> (WIF format) or <code>PVT_K1_...</code> (WebAuth format)\n\n` +
+        `Your message has been deleted for security.`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    // Delete user's message IMMEDIATELY — contains private key
+    await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+
+    const loading = await ctx.reply(`⏳ Verifying key for account <code>${accountName}</code>…`, { parse_mode: "HTML" });
 
     try {
-      const result = await createWallet(ctx.from.id, chosenName);
+      const result = await importWallet(ctx.from.id, privateKey, accountName);
 
-      if (result.nameTaken) {
+      if (result.error === "already_exists") {
         await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-          `❌ <b>Name taken</b>\n\n${result.onChain ? `<code>${chosenName}</code> already exists on XPR Network.` : `<code>${chosenName}</code> is already used in this bot.`}\n\nTry: /wallet create &lt;name&gt;`,
+          `✅ Wallet already connected: <code>${result.accountName}</code>`,
           { parse_mode: "HTML" }
         );
         return;
       }
 
-      const creationStatus = result.accountCreated
-        ? `✅ Account registered on XPR Network — ready to receive XPR`
-        : `⚠️ On-chain registration failed: ${result.creationError}`;
+      if (result.error === "key_mismatch") {
+        await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
+          `❌ <b>Key verification failed</b>\n\n${result.message}\n\n` +
+          `Make sure you're using the correct private key for <code>${accountName}</code>.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
 
-      await ctx.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-      await ctx.reply(
-        `🎉 <b>Wallet Created!</b>\n\n` +
-        `📬 <b>Account:</b> <code>${result.accountName}</code>\n` +
-        `🔑 <b>Public Key:</b> <code>${result.publicKey}</code>\n\n` +
-        `🌱 <b>Seed Phrase (SAVE THIS NOW):</b>\n` +
-        `<tg-spoiler>${result.mnemonic}</tg-spoiler>\n\n` +
-        `⚠️ <b>IMPORTANT:</b>\n` +
-        `• Write this down offline and store safely\n` +
-        `• This will NEVER be shown again\n` +
-        `• Anyone with this phrase controls your funds\n` +
-        `• Import into WebAuth app to access manually\n\n` +
-        `${creationStatus}\n\n` +
-        `💰 Fund your wallet: send XPR to <code>${result.accountName}</code>\n` +
-        `Then set up trading with /autobuy and /autosell`,
+      await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
+        `✅ <b>Wallet Connected!</b>\n\n` +
+        `📬 Account:    <code>${result.accountName}</code>\n` +
+        `🔑 Public Key: <code>${result.pubKey}</code>\n\n` +
+        `🗑 Your message containing the private key has been deleted.\n\n` +
+        `<b>Next steps:</b>\n` +
+        `• Fund your wallet with XPR via WebAuth\n` +
+        `• /autobuy 5 — auto-buy 5 XPR on every new launch\n` +
+        `• /autosell 3 — auto-sell at 3x\n` +
+        `• /balance — check your balance`,
         { parse_mode: "HTML" }
       );
 
     } catch (e) {
       await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-        `❌ Error: ${e.message}`
-      ).catch(() => ctx.reply(`❌ Error: ${e.message}`));
+        `❌ Import failed: ${e.message}`
+      ).catch(() => {});
     }
     return;
   }
 
-  // Default — show wallet info or usage
-  const wallet = await getWallet(ctx.from.id);
-  if (wallet) {
-    return ctx.reply(
-      `💼 <b>Your Wallet</b>\n\n` +
-      `Account: <code>${wallet.accountName}</code>\n` +
-      `Status: ${wallet.accountCreated ? "✅ Active on-chain" : "⚠️ Not yet registered"}\n\n` +
-      `Commands:\n` +
-      `/wallet address — show deposit address\n` +
-      `/balance — check XPR balance\n` +
-      `/autobuy 5 — auto-buy 5 XPR on new launches\n` +
-      `/autosell 3 — auto-sell at 3x`,
-      { parse_mode: "HTML" }
-    );
-  }
-
   await ctx.reply(
-    `👋 <b>XPR Trading Wallet</b>\n\n` +
-    `Create your trading wallet with a custom account name:\n\n` +
-    `<code>/wallet create yourname</code>\n\n` +
-    `Name rules: 3-12 chars, only a-z and 1-5`,
+    `Unknown wallet command. Use:\n` +
+    `/wallet — show status\n` +
+    `/wallet import &lt;key&gt; &lt;account&gt; — connect wallet\n` +
+    `/wallet address — deposit address\n` +
+    `/wallet remove — disconnect`,
     { parse_mode: "HTML" }
   );
 });
@@ -965,22 +955,37 @@ bot.command("wallet", async (ctx) => {
 bot.command("balance", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
   if (!wallet) return ctx.reply(
-    `❌ No wallet found.\n\nCreate one with: /wallet create yourname`,
+    `❌ No wallet found.\n\nUse /wallet import to connect your WebAuth wallet.`,
     { parse_mode: "HTML" }
   );
 
   const loading = await ctx.reply("⏳ Checking balance…");
 
-  const xpr = await getXprBalance(wallet.accountName);
-
-  let positions = [];
-  try { positions = await getOpenPositions(ctx.from.id); } catch {}
+  const [xpr, positions, holdings] = await Promise.all([
+    getXprBalance(wallet.accountName),
+    getOpenPositions(ctx.from.id).catch(() => []),
+    getAllHoldings(wallet.accountName).catch(() => []),
+  ]);
 
   let msg = `💼 <b>Wallet Balance</b>\n\n`;
   msg += `📬 Account: <code>${wallet.accountName}</code>\n`;
   msg += `💰 XPR:     <code>${xpr.toFixed(4)} XPR</code>\n\n`;
 
-  if (positions.length) {
+  if (holdings.length) {
+    msg += `🪙 <b>Bonding Curve Holdings</b>\n`;
+    for (const h of holdings) {
+      const pos = positions.find(p => String(p.tokenId) === String(h.tokenId));
+      const label = pos ? pos.symbol : `tokenId:${h.tokenId}`;
+      const currentToken = pos ? await getToken(pos.symbol).catch(() => null) : null;
+      const currentMcap  = currentToken?.mcap ?? 0;
+      const xMultiple    = pos?.entryMcap > 0 ? currentMcap / pos.entryMcap : 0;
+      const pnlStr       = xMultiple > 0 ? ` · ${xMultiple.toFixed(2)}x` : "";
+      const pnlEmoji     = xMultiple >= 1 ? "🟢" : xMultiple > 0 ? "🔴" : "";
+      msg += `   ${pnlEmoji} <b>${label}</b> — <code>${fmtNum(h.amount)}</code> tokens${pnlStr}\n`;
+      if (pos) msg += `      Spent: <code>${pos.xprSpent} XPR</code> · MCap: <code>$${fmtNum(currentMcap)}</code>\n`;
+    }
+    msg += `\n`;
+  } else if (positions.length) {
     msg += `📊 <b>Open Positions (${positions.length})</b>\n`;
     for (const p of positions) {
       msg += `   • ${p.symbol} — ${p.xprSpent} XPR spent\n`;
@@ -998,7 +1003,7 @@ bot.command("balance", async (ctx) => {
 
 bot.command("autobuy", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const arg = ctx.match?.trim().toLowerCase();
 
@@ -1037,7 +1042,7 @@ bot.command("autobuy", async (ctx) => {
 
 bot.command("autosell", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const arg = ctx.match?.trim().toLowerCase();
 
@@ -1076,7 +1081,7 @@ bot.command("autosell", async (ctx) => {
 
 bot.command("positions", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const positions = await getOpenPositions(ctx.from.id);
 
@@ -1091,10 +1096,10 @@ bot.command("positions", async (ctx) => {
   let msg = `📊 <b>Open Positions (${positions.length})</b>\n\n`;
 
   for (const p of positions) {
-    const token      = await getToken(p.symbol).catch(() => null);
+    const token       = await getToken(p.symbol).catch(() => null);
     const currentMcap = token?.mcap ?? 0;
-    const xMultiple  = p.entryMcap > 0 ? currentMcap / p.entryMcap : 0;
-    const pnlEmoji   = xMultiple >= 1 ? "🟢" : "🔴";
+    const xMultiple   = p.entryMcap > 0 ? currentMcap / p.entryMcap : 0;
+    const pnlEmoji    = xMultiple >= 1 ? "🟢" : "🔴";
 
     msg += `${pnlEmoji} <b>${p.symbol}</b>\n`;
     msg += `   Spent:   <code>${p.xprSpent} XPR</code>\n`;
@@ -1111,7 +1116,7 @@ bot.command("positions", async (ctx) => {
 
 bot.command("history", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const trades = await getTradeHistory(ctx.from.id, 10);
 
@@ -1160,12 +1165,9 @@ bot.command("quote", async (ctx) => {
       `❌ ${symbol} has graduated — trading on DEX pool, not bonding curve.`);
   }
 
-  // Estimate tokens using bonding curve formula:
-  // tokens = virtualTokens * xprAmount / (virtualXpr + xprAmount)
-  // All values from indexer already converted (not raw contract values)
   const price        = token.price ?? 0;
   const estTokens    = price > 0 ? xprAmt / price : 0;
-  const xprUsd       = xprAmt * 0.00035; // rough XPR/USD rate
+  const xprUsd       = xprAmt * 0.00035;
   const newMcap      = (token.mcap ?? 0) + xprUsd;
   const priceImpact  = token.mcap > 0 ? (xprUsd / token.mcap) * 100 : 0;
 
@@ -1186,7 +1188,7 @@ bot.command("quote", async (ctx) => {
 
 bot.command("buy", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const parts   = ctx.match?.trim().toUpperCase().split(/\s+/);
   const symbol  = parts?.[0];
@@ -1242,7 +1244,7 @@ bot.command("buy", async (ctx) => {
 
 bot.command("sell", async (ctx) => {
   const wallet = await getWallet(ctx.from.id);
-  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet create first.");
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
 
   const parts  = ctx.match?.trim().toUpperCase().split(/\s+/);
   const symbol = parts?.[0];
@@ -1257,14 +1259,19 @@ bot.command("sell", async (ctx) => {
 
   const loading = await ctx.reply(`⏳ Selling ${symbol}…`);
   try {
-    await sellTokens({
-      userId: ctx.from.id, accountName: wallet.accountName,
-      tokenId: token.tokenId, tokenAmount: position.tokenAmount, precision: 4,
+    const txResult = await sellTokens({
+      userId:      ctx.from.id,
+      accountName: wallet.accountName,
+      tokenId:     token.tokenId,
+      tokenAmount: position.tokenAmount,
+      symbol:      symbol,             // ← lets sellTokens fetch real balance if tokenAmount is 0
+      precision:   4,
     });
 
     const currentMcap = token.mcap ?? 0;
     const xMultiple   = position.entryMcap > 0 ? currentMcap / position.entryMcap : 1;
     const xprReceived = position.xprSpent * xMultiple;
+    const txId        = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
 
     const closed = await closePosition({ userId: ctx.from.id, symbol, xprReceived });
 
@@ -1273,10 +1280,12 @@ bot.command("sell", async (ctx) => {
       `📈 Multiple:  <code>${xMultiple.toFixed(2)}x</code>\n` +
       `💰 Spent:     <code>${position.xprSpent.toFixed(4)} XPR</code>\n` +
       `💵 Received:  <code>${xprReceived.toFixed(4)} XPR</code>\n` +
-      `📊 PNL:       <code>${closed.pnlXpr >= 0 ? "+" : ""}${closed.pnlXpr.toFixed(4)} XPR</code>`,
+      `📊 PNL:       <code>${closed.pnlXpr >= 0 ? "+" : ""}${closed.pnlXpr.toFixed(4)} XPR</code>\n` +
+      `🔗 TX:        <code>${txId}…</code>`,
       { parse_mode: "HTML" }
     );
   } catch (e) {
+    console.error("Manual sell error:", e.message);
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
       `❌ Sell failed: ${e.message}`
     ).catch(() => {});
@@ -1290,4 +1299,5 @@ console.log("🚀 XPR Radar Bot starting...");
 startLaunchNotifier(bot);
 registerAutoBuyHandler(autoBuyNewToken);
 startPositionMonitor(bot);
+startDepositMonitor(bot);
 bot.start();

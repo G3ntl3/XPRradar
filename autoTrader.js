@@ -1,12 +1,15 @@
 /**
  * Auto Trader
- * - Hooks into launch notifier to auto-buy new tokens
- * - Monitors open positions every 30s and auto-sells at target
+ * - Auto-buys new tokens for subscribed users on launch
+ * - Monitors open positions every 30s, auto-sells at target or stop-loss
+ *
+ * Uses getBondingBalance() which queries the "holdings" table
+ * (scope=accountName, struct: { tokenId, amount }) for real on-chain balances.
  */
 
 import { getAllActiveAutobuyers, getWallet } from "./wallet.js";
-import { buyTokens, sellTokens, getXprBalance } from "./trader.js";
-import { openPosition, closePosition, getAllOpenPositions } from "./positions.js";
+import { buyTokens, sellTokens, getXprBalance, getBondingBalance, getAllHoldings } from "./trader.js";
+import { openPosition, closePosition, getAllOpenPositions, getPosition } from "./positions.js";
 import { getToken } from "./xprApi.js";
 
 const MONITOR_INTERVAL = 30_000; // check positions every 30s
@@ -27,12 +30,11 @@ export async function autoBuyNewToken(bot, token) {
   const buyers = await getAllActiveAutobuyers();
   if (!buyers.length) return;
 
-  console.log(`🤖 Auto-buying ${token.symbol} for ${buyers.length} users`);
+  console.log(`🤖 Auto-buying ${token.symbol} (tokenId=${token.tokenId}) for ${buyers.length} users`);
 
   for (const user of buyers) {
     try {
       await executeBuy(bot, user, token);
-      // Small delay between users to avoid nonce issues
       await new Promise(r => setTimeout(r, 500));
     } catch (e) {
       console.error(`Auto-buy failed for user ${user.userId}:`, e.message);
@@ -47,7 +49,7 @@ export async function autoBuyNewToken(bot, token) {
 async function executeBuy(bot, user, token) {
   const { userId, accountName, autoBuyXpr } = user;
 
-  // Check balance
+  // Check XPR balance
   const balance = await getXprBalance(accountName);
   if (balance < autoBuyXpr) {
     await bot.api.sendMessage(Number(userId),
@@ -59,7 +61,7 @@ async function executeBuy(bot, user, token) {
     return;
   }
 
-  // Execute buy
+  // Execute buy on-chain
   const txResult = await buyTokens({
     userId,
     accountName,
@@ -67,13 +69,14 @@ async function executeBuy(bot, user, token) {
     xprAmount: autoBuyXpr,
   });
 
-  // Estimate tokens received from bonding curve
-  // realXpr increases by xprAmount, tokens received = virtualTokens * xprAmount / (virtualXpr + xprAmount)
-  const tokensReceived = token.virtualTokens
-    ? (parseFloat(token.virtualTokens) * autoBuyXpr) / (parseFloat(token.virtualXpr ?? 0) + autoBuyXpr)
-    : 0;
+  const txId = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
 
-  // Record position
+  // Wait a moment then read the REAL token amount from holdings table
+  await new Promise(r => setTimeout(r, 2000));
+  const realTokenAmount = await getBondingBalance(accountName, token.tokenId);
+  console.log(`Auto-buy: real holdings after buy = ${realTokenAmount} ${token.symbol}`);
+
+  // Record position with real token amount
   await openPosition({
     userId,
     accountName,
@@ -81,17 +84,15 @@ async function executeBuy(bot, user, token) {
     tokenId:     token.tokenId,
     tokenName:   token.name,
     xprSpent:    autoBuyXpr,
-    tokenAmount: tokensReceived,
+    tokenAmount: realTokenAmount,
     entryMcap:   token.mcap ?? 0,
     autoSellX:   user.autoSellX,
   });
 
-  const txId = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
-
   await bot.api.sendMessage(Number(userId),
     `✅ <b>Auto-bought ${token.symbol}!</b>\n\n` +
     `💰 Spent:    <code>${autoBuyXpr} XPR</code>\n` +
-    `🪙 Token:    <code>${token.name}</code>\n` +
+    `🪙 Received: <code>${fmtNum(realTokenAmount)} ${token.symbol}</code>\n` +
     `📊 MCap:     <code>$${fmtNum(token.mcap)}</code>\n` +
     `🎯 Sell at:  <code>${user.autoSellX}x</code> mcap\n` +
     `🔗 TX:       <code>${txId}…</code>\n\n` +
@@ -100,7 +101,7 @@ async function executeBuy(bot, user, token) {
   ).catch(() => {});
 }
 
-// ─── Monitor positions and auto-sell at target ────────────────────────────────
+// ─── Monitor positions and auto-sell at target or stop-loss ──────────────────
 
 export async function startPositionMonitor(bot) {
   console.log("📊 Position monitor started.");
@@ -113,7 +114,7 @@ async function monitorPositions(bot) {
     positions = await getAllOpenPositions();
   } catch (e) {
     console.warn("Position monitor — DB unavailable:", e.message);
-    return; // Skip this cycle, try again next interval
+    return;
   }
   if (!positions.length) return;
 
@@ -125,14 +126,18 @@ async function monitorPositions(bot) {
       const currentMcap = token.mcap ?? 0;
       const xMultiple   = pos.entryMcap > 0 ? currentMcap / pos.entryMcap : 0;
 
-      // Check if target hit
-      if (xMultiple >= pos.autoSellX) {
-        await executeSell(bot, pos, token, currentMcap, xMultiple);
+      // Target hit
+      if (pos.autoSellEnabled !== false && xMultiple >= pos.autoSellX) {
+        console.log(`📈 Auto-sell target hit: ${pos.symbol} at ${xMultiple.toFixed(2)}x`);
+        await executeSell(bot, pos, token, currentMcap, xMultiple, false);
+        continue;
       }
 
-      // Stop-loss: auto-sell if down 60% from entry
+      // Stop-loss: down 60% from entry
       if (xMultiple > 0 && xMultiple <= 0.4) {
+        console.log(`🛑 Stop-loss triggered: ${pos.symbol} at ${xMultiple.toFixed(2)}x`);
         await executeSell(bot, pos, token, currentMcap, xMultiple, true);
+        continue;
       }
 
     } catch (e) {
@@ -148,34 +153,43 @@ async function executeSell(bot, pos, token, currentMcap, xMultiple, isStopLoss =
   if (!wallet) return;
 
   try {
+    // Get real on-chain balance from holdings table before selling
+    const liveBalance = await getBondingBalance(pos.accountName, pos.tokenId);
+
+    if (!liveBalance || liveBalance <= 0) {
+      console.log(`executeSell: no holdings for ${pos.symbol} tokenId=${pos.tokenId} — closing position`);
+      // Position may already be sold manually — just close it in DB
+      await closePosition({ userId: pos.userId, symbol: pos.symbol, xprReceived: 0 });
+      return;
+    }
+
+    console.log(`executeSell: selling ${liveBalance} ${pos.symbol} (tokenId=${pos.tokenId})`);
+
     const txResult = await sellTokens({
       userId:      pos.userId,
       accountName: pos.accountName,
       tokenId:     pos.tokenId,
-      tokenAmount: pos.tokenAmount,
+      tokenAmount: liveBalance,
+      symbol:      pos.symbol,
       precision:   4,
     });
 
-    // Estimate XPR received
-    const xprReceived = pos.xprSpent * xMultiple;
+    // Estimate XPR received based on mcap multiple
+    const xprReceived = pos.xprSpent > 0 ? pos.xprSpent * xMultiple : 0;
+    const txId        = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
 
-    const closed = await closePosition({
-      userId:      pos.userId,
-      symbol:      pos.symbol,
-      xprReceived,
-    });
-
+    const closed   = await closePosition({ userId: pos.userId, symbol: pos.symbol, xprReceived });
     const isProfit = xprReceived >= pos.xprSpent;
     const emoji    = isStopLoss ? "🛑" : isProfit ? "✅" : "📉";
     const label    = isStopLoss ? "Stop-Loss Triggered" : isProfit ? "Auto-Sold — Profit!" : "Auto-Sold";
-    const txId     = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
 
     await bot.api.sendMessage(Number(pos.userId),
       `${emoji} <b>${label}</b>\n\n` +
       `🪙 Token:     <code>${pos.tokenName} (${pos.symbol})</code>\n` +
+      `🪙 Amount:    <code>${fmtNum(liveBalance)} ${pos.symbol}</code>\n` +
       `📈 Multiple:  <code>${xMultiple.toFixed(2)}x</code>\n` +
       `💰 Spent:     <code>${pos.xprSpent.toFixed(4)} XPR</code>\n` +
-      `💵 Received:  <code>${xprReceived.toFixed(4)} XPR</code>\n` +
+      `💵 Received:  <code>~${xprReceived.toFixed(4)} XPR</code>\n` +
       `📊 PNL:       <code>${closed.pnlXpr >= 0 ? "+" : ""}${closed.pnlXpr.toFixed(4)} XPR</code>\n` +
       `🔗 TX:        <code>${txId}…</code>`,
       { parse_mode: "HTML" }
