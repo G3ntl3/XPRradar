@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "build": "npm install"
   },
   "dependencies": {
     "grammy": "^1.27.0",
