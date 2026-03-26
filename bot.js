@@ -7,7 +7,7 @@ import { generatePnlCard } from "./pnlCard.js";
 import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSubscribedToLaunches, registerAutoBuyHandler } from "./launchNotifier.js";
 import { importWallet, getWallet, updateWalletSettings, removeWallet, isValidPrivateKey } from "./wallet.js";
 import { buyTokens, sellTokens, getXprBalance, getTokenBalance, getBondingBalance, getAllHoldings } from "./trader.js";
-import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition } from "./positions.js";
+import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition, updatePositionSL } from "./positions.js";
 import { startPositionMonitor, autoBuyNewToken } from "./autoTrader.js";
 import { startDepositMonitor } from "./depositMonitor.js";
 
@@ -140,7 +140,9 @@ bot.command("start", async (ctx) => {
     `/sell &lt;SYMBOL&gt; — Sell all tokens for symbol\n` +
     `/quote &lt;SYMBOL&gt; &lt;amount&gt; — Preview buy before executing\n` +
     `/autobuy &lt;amount&gt; — Auto-buy on new launches\n` +
-    `/autosell &lt;multiplier&gt; — Auto-sell at target\n` +
+    `/autosell &lt;multiplier&gt; — Default target multiplier\n` +
+    `/stoploss &lt;percent&gt; — Default stop-loss % (e.g. /stoploss 50)\n` +
+    `/sl &lt;SYMBOL&gt; &lt;percent&gt; — Update SL for an open trade\n` +
     `/positions — Open trades + live PNL\n` +
     `/history — Closed trades\n\n` +
     `/help — Full command details`,
@@ -996,7 +998,8 @@ bot.command("balance", async (ctx) => {
   }
 
   msg += `⚙️ Auto-buy:  ${wallet.autoBuyEnabled  ? `✅ ${wallet.autoBuyXpr} XPR/trade` : "❌ Off"}\n`;
-  msg += `⚙️ Auto-sell: ${wallet.autoSellEnabled ? `✅ ${wallet.autoSellX}x target`    : "❌ Off"}`;
+  msg += `⚙️ Auto-sell: ${wallet.autoSellEnabled ? `✅ ${wallet.autoSellX}x target`    : "❌ Off"}\n`;
+  msg += `⚙️ Stop-loss: ${wallet.autoSellEnabled ? `✅ ${Math.round((1 - (wallet.autoSellSL || 0.2)) * 100)}% drop` : "❌ Off"}`;
 
   await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, { parse_mode: "HTML" });
 });
@@ -1072,9 +1075,84 @@ bot.command("autosell", async (ctx) => {
 
   await ctx.reply(
     `✅ <b>Auto-sell enabled!</b>\n\n` +
-    `Target: <code>${multiplier}x</code> from entry mcap\n` +
-    `Stop-loss: <code>60%</code> drop from entry\n\n` +
+    `Target: <code>${multiplier}x</code> from entry mcap\n\n` +
     `Use /autosell off to disable.`,
+    { parse_mode: "HTML" }
+  );
+});
+
+// ─── /stoploss ────────────────────────────────────────────────────────────────
+
+bot.command("stoploss", async (ctx) => {
+  const wallet = await getWallet(ctx.from.id);
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
+
+  const arg = ctx.match?.trim().toLowerCase();
+
+  if (arg === "off" || arg === "stop") {
+    // Note: Stop-loss is tied to auto-sell logic. Disabling it usually means disabling auto-sell or setting it very low.
+    // For now, let's just allow setting the percentage.
+    return ctx.reply("To disable auto-selling completely, use /autosell off.");
+  }
+
+  const dropPct = parseFloat(arg);
+  if (isNaN(dropPct) || dropPct <= 0 || dropPct >= 100) {
+    const currentSL = wallet.autoSellSL || 0.2;
+    return ctx.reply(
+      `⚙️ <b>Global Stop-Loss Settings</b>\n\n` +
+      `Current: <code>${Math.round((1 - currentSL) * 100)}%</code> drop (~${currentSL.toFixed(2)}x)\n\n` +
+      `Set new: /stoploss 50 (sell if down 50%)\n` +
+      `Set new: /stoploss 80 (sell if down 80%)`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  // Convert 30% drop -> 0.7x multiple. 80% drop -> 0.2x multiple.
+  const slMultiple = (100 - dropPct) / 100;
+
+  await updateWalletSettings(ctx.from.id, {
+    autoSellSL: slMultiple,
+  });
+
+  await ctx.reply(
+    `✅ <b>Default Stop-Loss updated!</b>\n\n` +
+    `New trades will auto-sell if they drop <code>${dropPct}%</code> from entry.\n` +
+    `<i>(Current threshold: ${slMultiple.toFixed(2)}x mcap)</i>`,
+    { parse_mode: "HTML" }
+  );
+});
+
+// ─── /sl <SYMBOL> <PERCENT> ──────────────────────────────────────────────────
+
+bot.command("sl", async (ctx) => {
+  const wallet = await getWallet(ctx.from.id);
+  if (!wallet) return ctx.reply("❌ No wallet. Use /wallet import first.");
+
+  const parts  = ctx.match?.trim().toUpperCase().split(/\s+/);
+  const symbol = parts?.[0];
+  const dropPct = parseFloat(parts?.[1]);
+
+  if (!symbol || isNaN(dropPct)) {
+    return ctx.reply(
+      `⚙️ <b>Update Stop-Loss for a Trade</b>\n\n` +
+      `<b>Usage:</b> /sl &lt;SYMBOL&gt; &lt;PERCENT&gt;\n` +
+      `<b>Example:</b> <code>/sl MARSH 50</code> (Set MARSH to sell if it drops 50%)\n\n` +
+      `This only affects your current open trade for that token.`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const slMultiple = (100 - dropPct) / 100;
+  const success = await updatePositionSL(ctx.from.id, symbol, slMultiple);
+
+  if (!success) {
+    return ctx.reply(`❌ No open position found for <b>${symbol}</b>.`, { parse_mode: "HTML" });
+  }
+
+  await ctx.reply(
+    `✅ <b>Stop-loss updated for ${symbol}!</b>\n\n` +
+    `Bot will now sell if <b>${symbol}</b> drops <code>${dropPct}%</code> from your entry mcap.\n` +
+    `<i>(Threshold: ${slMultiple.toFixed(2)}x)</i>`,
     { parse_mode: "HTML" }
   );
 });
@@ -1108,7 +1186,8 @@ bot.command("positions", async (ctx) => {
     msg += `   Entry:   <code>$${fmtNum(p.entryMcap)}</code> mcap\n`;
     msg += `   Current: <code>$${fmtNum(currentMcap)}</code> mcap\n`;
     msg += `   P/L:     <code>${xMultiple.toFixed(2)}x</code>\n`;
-    msg += `   Target:  <code>${p.autoSellX}x</code>\n\n`;
+    msg += `   Target:  <code>${p.autoSellX}x</code>\n`;
+    msg += `   SL:      <code>${Math.round((1 - (p.autoSellSL || 0.2)) * 100)}%</code> drop\n\n`;
   }
 
   await ctx.reply(msg, { parse_mode: "HTML" });
@@ -1225,6 +1304,7 @@ bot.command("buy", async (ctx) => {
       tokenName: token.name, xprSpent: xprAmt,
       tokenAmount: 0, entryMcap: token.mcap ?? 0,
       autoSellX: wallet.autoSellX,
+      autoSellSL: wallet.autoSellSL || 0.2,
     });
 
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,

@@ -99,7 +99,28 @@ function fmtXpr(amount) {
 }
 
 function rawTokenAmount(amount, precision = 4) {
-  return Math.floor(parseFloat(amount) * Math.pow(10, precision));
+  return Math.round(parseFloat(amount) * Math.pow(10, precision));
+}
+
+export async function getTokenPrecision(symbol, contract = "eosio.token") {
+  try {
+    const data = await rpcPost("/v1/chain/get_table_rows", {
+      code:  contract,
+      scope: symbol,
+      table: "stat",
+      json:  true,
+    });
+    const rows = data?.rows ?? [];
+    if (!rows.length) return 4;
+    
+    // supply: "1000000000.0000 SYMBOL"
+    const supply = rows[0].supply;
+    const parts  = supply.split(" ")[0].split(".");
+    return parts.length > 1 ? parts[1].length : 0;
+  } catch (e) {
+    console.warn(`getTokenPrecision error for ${symbol}:`, e.message);
+    return 4;
+  }
 }
 
 // ─── Extract readable error from eosjs ───────────────────────────────────────
@@ -133,7 +154,7 @@ export async function getXprBalance(accountName) {
 // ─── Bonding curve token balance ─────────────────────────────────────────────
 // Table: "holdings", scope: accountName, struct: { tokenId, amount }
 
-export async function getBondingBalance(accountName, tokenId) {
+export async function getBondingBalance(accountName, tokenId, precision = 4) {
   try {
     const data = await rpcPost("/v1/chain/get_table_rows", {
       code:  CONTRACT,
@@ -144,15 +165,11 @@ export async function getBondingBalance(accountName, tokenId) {
     });
 
     const rows = data?.rows ?? [];
-    console.log(`getBondingBalance: account=${accountName} rows=${rows.length}`, JSON.stringify(rows));
-
-    const row = rows.find(r => String(r.tokenId) === String(tokenId));
+    const row  = rows.find(r => String(r.tokenId) === String(tokenId));
     if (!row) return 0;
 
-    const amount = row.amount / 10000;
-    console.log(`getBondingBalance: found ${amount} (raw: ${row.amount}) tokenId=${tokenId}`);
+    const amount = row.amount / Math.pow(10, precision);
     return amount;
-
   } catch (e) {
     console.warn("getBondingBalance error:", e.message);
     return 0;
@@ -224,13 +241,16 @@ export async function buyTokens({ userId, accountName, tokenId, xprAmount }) {
 
 // ─── Sell tokens ──────────────────────────────────────────────────────────────
 
-export async function sellTokens({ userId, accountName, tokenId, tokenAmount, symbol, precision = 4 }) {
+export async function sellTokens({ userId, accountName, tokenId, tokenAmount, symbol, precision = null }) {
   const privateKey = await getPrivateKey(userId);
   if (!privateKey) throw new Error("No wallet found for user");
 
+  // Step 0: Auto-detect precision if not provided
+  const actualPrecision = (precision !== null) ? precision : await getTokenPrecision(symbol);
+
   // Step 1: Live holdings table balance
   let amount = 0;
-  if (tokenId != null) amount = await getBondingBalance(accountName, tokenId);
+  if (tokenId != null) amount = await getBondingBalance(accountName, tokenId, actualPrecision);
 
   // Step 2: Stored tokenAmount fallback
   if (!amount && tokenAmount) amount = parseFloat(tokenAmount);
@@ -246,8 +266,8 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
 
   if (!amount || amount <= 0) throw new Error("No token balance to sell");
 
-  const rawAmount = rawTokenAmount(amount, precision);
-  console.log(`sellTokens: ${amount} ${symbol ?? ""} (raw: ${rawAmount}) tokenId=${tokenId}`);
+  const rawAmount = rawTokenAmount(amount, actualPrecision);
+  console.log(`sellTokens: ${amount} ${symbol ?? ""} (raw: ${rawAmount}, p: ${actualPrecision}) tokenId=${tokenId}`);
 
   const api = await getWorkingApi(privateKey);
   try {

@@ -6,10 +6,9 @@
 import { getMongoCollection } from "./db.js";
 
 // ─── Open a position after a buy ──────────────────────────────────────────────
-
 export async function openPosition({
   userId, accountName, symbol, tokenId,
-  tokenName, xprSpent, tokenAmount, entryMcap, autoSellX,
+  tokenName, xprSpent, tokenAmount, entryMcap, autoSellX, autoSellSL,
 }) {
   const col = await getMongoCollection("positions");
   await col.insertOne({
@@ -22,10 +21,28 @@ export async function openPosition({
     tokenAmount,
     entryMcap,
     targetMcap:  entryMcap * autoSellX,
+    stopMcap:    entryMcap * (autoSellSL || 0.2), // Default to 80% if not set
     autoSellX,
+    autoSellSL:  autoSellSL || 0.2,
     openedAt:    new Date(),
     status:      "open",
   });
+}
+
+// ─── Update position settings ────────────────────────────────────────────────
+export async function updatePositionSL(userId, symbol, autoSellSL) {
+  const col = await getMongoCollection("positions");
+  const pos = await col.findOne({ userId: String(userId), symbol, status: "open" });
+  if (!pos) return false;
+
+  await col.updateOne(
+    { _id: pos._id },
+    { $set: { 
+      autoSellSL,
+      stopMcap: pos.entryMcap * autoSellSL 
+    }}
+  );
+  return true;
 }
 
 // ─── Close a position after a sell ───────────────────────────────────────────

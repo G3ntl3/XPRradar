@@ -30,84 +30,125 @@ export async function autoBuyNewToken(bot, token) {
   const buyers = await getAllActiveAutobuyers();
   if (!buyers.length) return;
 
-  console.log(`🤖 Auto-buying ${token.symbol} (tokenId=${token.tokenId}) for ${buyers.length} users`);
+  console.log(`🤖 Sniper Mode: Auto-buying ${token.symbol} for ${buyers.length} users in parallel batches`);
 
-  for (const user of buyers) {
-    try {
-      await executeBuy(bot, user, token);
-      await new Promise(r => setTimeout(r, 500));
-    } catch (e) {
+  const BATCH_SIZE = 50;
+  const chunks = [];
+  for (let i = 0; i < buyers.length; i += BATCH_SIZE) {
+    chunks.push(buyers.slice(i, i + BATCH_SIZE));
+  }
+
+  for (const chunk of chunks) {
+    console.log(`🚀 Dispatching batch of ${chunk.length} trades...`);
+    
+    // Fire all trades in the chunk at once
+    const results = await Promise.allSettled(
+      chunk.map(user => executeBuy(bot, user, token, true)) // true = silent/background
+    );
+
+    results.forEach((res, i) => {
+      if (res.status === "rejected") {
+        console.error(`Trade failed for user ${chunk[i].userId}:`, res.reason);
+      }
+    });
+
+    // Optional: tiny delay between batches to help domestic RPCs breathe
+    if (chunks.length > 1) await new Promise(r => setTimeout(r, 100));
+  }
+}
+
+async function executeBuy(bot, user, token, silent = false) {
+  const { userId, accountName, autoBuyXpr } = user;
+
+  try {
+    // Check XPR balance
+    const balance = await getXprBalance(accountName);
+    if (balance < autoBuyXpr) {
+      if (!silent) {
+        await bot.api.sendMessage(Number(userId),
+          `⚠️ <b>Insufficient balance</b> for auto-buy of <b>${token.symbol}</b>\n\n` +
+          `📬 Account: <code>${accountName}</code>\n` +
+          `💰 Balance: <code>${balance.toFixed(4)} XPR</code>\n` +
+          `📉 Need:    <code>${autoBuyXpr} XPR</code>\n\n` +
+          `Fund your wallet to enable auto-trading.`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    // Execute buy on-chain
+    const txResult = await buyTokens({
+      userId,
+      accountName,
+      tokenId:   token.tokenId,
+      xprAmount: autoBuyXpr,
+    });
+
+    const txId = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
+
+    // Record position immediately. We set tokenAmount to 0 for now to avoid blocking.
+    // The position monitor or a manual position refresh will fetch the real amount later.
+    await openPosition({
+      userId,
+      accountName,
+      symbol:      token.symbol,
+      tokenId:     token.tokenId,
+      tokenName:   token.name,
+      xprSpent:    autoBuyXpr,
+      tokenAmount: 0, 
+      entryMcap:   token.mcap ?? 0,
+      autoSellX:   user.autoSellX,
+      autoSellSL:  user.autoSellSL || 0.2,
+    });
+
+    // Queue status message (spaced out to avoid Telegram 429)
+    setTimeout(async () => {
+      await bot.api.sendMessage(Number(userId),
+        `✅ <b>Auto-bought ${token.symbol}!</b>\n\n` +
+        `💰 Spent:    <code>${autoBuyXpr} XPR</code>\n` +
+        `📊 MCap:     <code>$${fmtNum(token.mcap)}</code>\n` +
+        `🎯 Target:   <code>${user.autoSellX}x</code>\n` +
+        `🔗 TX:       <code>${txId}…</code>\n\n` +
+        `Use /positions to track your trades.`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    }, Math.random() * 5000); // Random delay 0-5s to smooth out bot traffic
+
+  } catch (e) {
+    if (!silent) {
       console.error(`Auto-buy failed for user ${user.userId}:`, e.message);
       await bot.api.sendMessage(Number(user.userId),
         `⚠️ Auto-buy failed for <b>${token.symbol}</b>: ${e.message}`,
         { parse_mode: "HTML" }
       ).catch(() => {});
     }
+    throw e;
   }
-}
-
-async function executeBuy(bot, user, token) {
-  const { userId, accountName, autoBuyXpr } = user;
-
-  // Check XPR balance
-  const balance = await getXprBalance(accountName);
-  if (balance < autoBuyXpr) {
-    await bot.api.sendMessage(Number(userId),
-      `⚠️ <b>Insufficient balance</b> for auto-buy of <b>${token.symbol}</b>\n\n` +
-      `📬 Account: <code>${accountName}</code>\n` +
-      `💰 Balance: <code>${balance.toFixed(4)} XPR</code>\n` +
-      `📉 Need:    <code>${autoBuyXpr} XPR</code>\n\n` +
-      `Fund your wallet to enable auto-trading.`,
-      { parse_mode: "HTML" }
-    ).catch(() => {});
-    return;
-  }
-
-  // Execute buy on-chain
-  const txResult = await buyTokens({
-    userId,
-    accountName,
-    tokenId:   token.tokenId,
-    xprAmount: autoBuyXpr,
-  });
-
-  const txId = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
-
-  // Wait a moment then read the REAL token amount from holdings table
-  await new Promise(r => setTimeout(r, 2000));
-  const realTokenAmount = await getBondingBalance(accountName, token.tokenId);
-  console.log(`Auto-buy: real holdings after buy = ${realTokenAmount} ${token.symbol}`);
-
-  // Record position with real token amount
-  await openPosition({
-    userId,
-    accountName,
-    symbol:      token.symbol,
-    tokenId:     token.tokenId,
-    tokenName:   token.name,
-    xprSpent:    autoBuyXpr,
-    tokenAmount: realTokenAmount,
-    entryMcap:   token.mcap ?? 0,
-    autoSellX:   user.autoSellX,
-  });
-
-  await bot.api.sendMessage(Number(userId),
-    `✅ <b>Auto-bought ${token.symbol}!</b>\n\n` +
-    `💰 Spent:    <code>${autoBuyXpr} XPR</code>\n` +
-    `🪙 Received: <code>${fmtNum(realTokenAmount)} ${token.symbol}</code>\n` +
-    `📊 MCap:     <code>$${fmtNum(token.mcap)}</code>\n` +
-    `🎯 Sell at:  <code>${user.autoSellX}x</code> mcap\n` +
-    `🔗 TX:       <code>${txId}…</code>\n\n` +
-    `Use /positions to track your trades.`,
-    { parse_mode: "HTML" }
-  ).catch(() => {});
 }
 
 // ─── Monitor positions and auto-sell at target or stop-loss ──────────────────
 
+let isMonitoring = false;
+
 export async function startPositionMonitor(bot) {
   console.log("📊 Position monitor started.");
-  setInterval(() => monitorPositions(bot).catch(console.error), MONITOR_INTERVAL);
+  
+  const tick = async () => {
+    if (isMonitoring) return;
+    isMonitoring = true;
+    
+    try {
+      await monitorPositions(bot);
+    } catch (e) {
+      console.error("Monitor loop error:", e.message);
+    } finally {
+      isMonitoring = false;
+      setTimeout(tick, MONITOR_INTERVAL); // Schedule next run ONLY after current one finishes
+    }
+  };
+
+  tick();
 }
 
 async function monitorPositions(bot) {
@@ -126,7 +167,19 @@ async function monitorPositions(bot) {
       if (!token) continue;
 
       const currentMcap = token.mcap ?? 0;
-      const xMultiple   = pos.entryMcap > 0 ? currentMcap / pos.entryMcap : 0;
+      
+      // FIX (Bug #2): If entry was 0, it was a brand new launch. 
+      // Update entryMcap to the first valid non-zero price we see, then skip this tick.
+      if (pos.entryMcap <= 0 && currentMcap > 0) {
+        console.log(`📝 Recording first valid mcap for ${pos.symbol}: $${fmtNum(currentMcap)}`);
+        // We'll update the position in background
+        const col = await getMongoCollection("positions");
+        await col.updateOne({ _id: pos._id }, { $set: { entryMcap: currentMcap } });
+        continue;
+      }
+
+      // Safe calculation: if entry still 0, we can't calculate P/L yet
+      const xMultiple = (pos.entryMcap > 0 && currentMcap > 0) ? currentMcap / pos.entryMcap : 0;
 
       // Target hit
       if (pos.autoSellEnabled !== false && xMultiple >= pos.autoSellX) {
@@ -135,9 +188,10 @@ async function monitorPositions(bot) {
         continue;
       }
 
-      // Stop-loss: down 60% from entry
-      if (xMultiple > 0 && xMultiple <= 0.2) {
-        console.log(`🛑 Stop-loss triggered: ${pos.symbol} at ${xMultiple.toFixed(2)}x`);
+      // Stop-loss: based on per-position setting (default 0.2 i.e. 80% drop)
+      const slThreshold = pos.autoSellSL || 0.2;
+      if (xMultiple > 0 && xMultiple <= slThreshold) {
+        console.log(`🛑 Stop-loss triggered: ${pos.symbol} at ${xMultiple.toFixed(2)}x (limit: ${slThreshold}x)`);
         await executeSell(bot, pos, token, currentMcap, xMultiple, true);
         continue;
       }
