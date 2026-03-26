@@ -1,43 +1,63 @@
-import fs from "fs";
+/**
+ * Snapshots — in-memory with async persistence
+ *
+ * KEY CHANGES FROM ORIGINAL:
+ * 1. All reads are instant (Map lookup) — original read entire file every call
+ * 2. Writes are async — original used sync writeFileSync on every save
+ * 3. File is written max once per 5s (debounced) — not on every saveSnapshot()
+ * 4. getUserSnapshots() uses a prefix scan on the Map — no file I/O
+ */
 
-const SNAPSHOT_FILE = "./snapshots.json";
+import fs   from "fs";
+import path from "path";
 
-function load() {
-  try {
-    if (fs.existsSync(SNAPSHOT_FILE)) return JSON.parse(fs.readFileSync(SNAPSHOT_FILE, "utf8"));
-  } catch {}
-  return {};
+const SNAP_FILE = "./snapshots.json";
+
+// ─── In-memory store ─────────────────────────────────────────────────────────
+
+const _cache = new Map(); // "userId:SYMBOL" -> { price, timestamp }
+let   _dirty = false;
+
+// Load once at startup
+try {
+  if (fs.existsSync(SNAP_FILE)) {
+    const raw = JSON.parse(fs.readFileSync(SNAP_FILE, "utf8"));
+    for (const [k, v] of Object.entries(raw)) _cache.set(k, v);
+    console.log(`📸 Snapshots loaded: ${_cache.size} entries`);
+  }
+} catch (e) {
+  console.warn("Snapshots load error:", e.message);
 }
 
-function save(data) {
-  fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(data, null, 2));
-}
+// Flush to disk every 5s if dirty — fully async, never blocks
+setInterval(() => {
+  if (!_dirty) return;
+  _dirty = false;
+  const obj = Object.fromEntries(_cache);
+  fs.promises.mkdir(path.dirname(SNAP_FILE), { recursive: true })
+    .then(() => fs.promises.writeFile(SNAP_FILE, JSON.stringify(obj)))
+    .catch(e => console.warn("Snapshots flush error:", e.message));
+}, 5_000);
 
-// Save price snapshot when user checks a token
-// Key: userId:SYMBOL
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 export function saveSnapshot(userId, symbol, price) {
-  const data = load();
-  const key = `${userId}:${symbol.toUpperCase()}`;
-  data[key] = {
+  _cache.set(`${userId}:${symbol.toUpperCase()}`, {
     price,
     timestamp: Math.floor(Date.now() / 1000),
-  };
-  save(data);
+  });
+  _dirty = true; // will flush within 5s
 }
 
-// Get last snapshot for a user + token
 export function getSnapshot(userId, symbol) {
-  const data = load();
-  return data[`${userId}:${symbol.toUpperCase()}`] ?? null;
+  return _cache.get(`${userId}:${symbol.toUpperCase()}`) ?? null;
 }
 
-// Get all snapshots for a user
 export function getUserSnapshots(userId) {
-  const data = load();
+  const prefix = `${userId}:`;
   const result = {};
-  for (const [key, val] of Object.entries(data)) {
-    const [uid, symbol] = key.split(":");
-    if (uid === String(userId)) result[symbol] = val;
+  for (const [k, v] of _cache.entries()) {
+    if (k.startsWith(prefix)) result[k.slice(prefix.length)] = v;
   }
   return result;
 }

@@ -3,7 +3,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BG_PATH   = path.join(__dirname, "pnl_bg.png");
 
 function timeSince(ts) {
   const secs = Math.floor(Date.now() / 1000) - ts;
@@ -25,7 +24,7 @@ function fmtMcap(n) {
 }
 
 function blendRect(img, x, y, w, h, r, g, b, alpha) {
-  const a = alpha / 255;
+  const a  = alpha / 255;
   const ia = 1 - a;
   for (let px = x; px < Math.min(x + w, img.bitmap.width); px++) {
     for (let py = y; py < Math.min(y + h, img.bitmap.height); py++) {
@@ -43,17 +42,23 @@ function blendRect(img, x, y, w, h, r, g, b, alpha) {
 export async function generatePnlCard({
   symbol, tokenName, mcapThen, mcapNow, pctChange, xChange, snapTimestamp,
 }) {
-  const isUp = pctChange >= 0;
-  const W = 900, H = 470;
+  const isUp  = pctChange >= 0;
+  const W     = 900, H = 470;
+
+  // Use win.png for positive, loss.png for negative
+  const bgFile = isUp ? "win.png" : "loss.png";
+  const bgPath = path.join(__dirname, bgFile);
 
   let img;
   try {
-    img = await Jimp.read(BG_PATH);
+    img = await Jimp.read(bgPath);
     img.resize(W, H);
   } catch {
-    img = new Jimp(W, H, 0x0d001aff);
+    // Fallback to solid colour if neither file exists
+    img = new Jimp(W, H, isUp ? 0x0d1a00ff : 0x1a000dff);
   }
 
+  // Dark overlay on right panel
   blendRect(img, 360, 0, W - 360, H, 0, 0, 10, 140);
   for (let x = 340; x < 360; x++) {
     blendRect(img, x, 0, 1, H, 0, 0, 10, Math.round(((x - 340) / 20) * 140));
@@ -72,10 +77,10 @@ export async function generatePnlCard({
   // Divider
   blendRect(img, PX, 132, W - PX - 30, 1, 255, 255, 255, 100);
 
-  // called at mcap — uses mcapThen
+  // Called at mcap
   img.print(f16, PX, 145, `called at   ${fmtMcap(mcapThen)} mcap`);
 
-  // Giant X pill
+  // Giant X pill — green for win, red for loss
   const sign  = isUp ? "+" : "";
   const xText = `${sign}${xChange.toFixed(2)}X`;
   blendRect(img, PX - 5, 182, W - PX - 25, 105,

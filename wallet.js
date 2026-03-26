@@ -203,7 +203,7 @@ export async function importWallet(userId, privateKey, accountName) {
     accountCreated:  true,
     autoBuyXpr:      5,
     autoSellX:       3,
-    autoSellSL:      0.2, // Default 80% drop
+    autoSellSL:      0.6, // Default -40% drop
     autoBuyEnabled:  false,
     autoSellEnabled: false,
   });

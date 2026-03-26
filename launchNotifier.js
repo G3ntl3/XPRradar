@@ -1,86 +1,105 @@
 /**
- * Launch Notifier — polls SimpleDEX for newly launched tokens
- * and pushes alerts to subscribed chats.
+ * Launch Notifier — optimized for minimum detection latency
+ *
+ * KEY CHANGES FROM ORIGINAL:
+ * 1. Poll every 2s instead of 30s — 15x faster detection
+ * 2. Subscriptions kept in memory (Map) — no file read on every check
+ * 3. autoBuy fires FIRST via setImmediate, BEFORE subscriber notifications
+ * 4. Subscriber notifications are parallel + fire-and-forget
+ * 5. saveSeen() is async — never blocks the poll loop
+ * 6. loadSubs()/saveSubs() are gone — replaced with in-memory Map
+ *    (persisted to file async on change, loaded once at startup)
  */
 
 import fetch from "node-fetch";
-import fs from "fs";
+import fs    from "fs";
 
-const API          = "https://indexer.protonnz.com/api";
-const SUBS_FILE    = "./launch_subs.json";
-const SEEN_FILE    = "./seen_tokens.json";
-const POLL_MS      = 30_000;  // check every 30 seconds
+const API       = "https://indexer.protonnz.com/api";
+const SUBS_FILE = "./launch_subs.json";
+const SEEN_FILE = "./seen_tokens.json";
+const POLL_MS   = 2_000; // 2 seconds — was 30s
 
-// ─── Persistence ─────────────────────────────────────────────────────────────
+// ─── In-memory state (loaded from disk once at startup) ───────────────────────
 
-function loadSubs() {
-  try {
-    if (fs.existsSync(SUBS_FILE)) return JSON.parse(fs.readFileSync(SUBS_FILE, "utf8"));
-  } catch {}
-  return {};
+const _subs = new Map(); // chatId -> true
+const _seen = new Set(); // tokenId -> true
+let   _autoBuyHandler = null;
+let   _bot            = null;
+let   _polling        = false;
+
+// Load subs from disk
+try {
+  if (fs.existsSync(SUBS_FILE)) {
+    const raw = JSON.parse(fs.readFileSync(SUBS_FILE, "utf8"));
+    for (const id of Object.keys(raw)) _subs.set(id, true);
+    console.log(`📋 Loaded ${_subs.size} launch subscribers`);
+  }
+} catch (e) { console.warn("loadSubs error:", e.message); }
+
+// Load seen tokens from disk
+try {
+  if (fs.existsSync(SEEN_FILE)) {
+    const raw = JSON.parse(fs.readFileSync(SEEN_FILE, "utf8"));
+    for (const id of raw) _seen.add(id);
+    console.log(`👁 Loaded ${_seen.size} seen token IDs`);
+  }
+} catch (e) { console.warn("loadSeen error:", e.message); }
+
+// ─── Async persistence — never blocks ────────────────────────────────────────
+
+function persistSubs() {
+  const obj = Object.fromEntries(_subs);
+  fs.promises.writeFile(SUBS_FILE, JSON.stringify(obj, null, 2))
+    .catch(e => console.warn("saveSubs error:", e.message));
 }
 
-function saveSubs(data) {
-  fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
+function persistSeen() {
+  fs.promises.writeFile(SEEN_FILE, JSON.stringify([..._seen]))
+    .catch(e => console.warn("saveSeen error:", e.message));
 }
 
-function loadSeen() {
-  try {
-    if (fs.existsSync(SEEN_FILE)) return new Set(JSON.parse(fs.readFileSync(SEEN_FILE, "utf8")));
-  } catch {}
-  return new Set();
-}
-
-function saveSeen(set) {
-  fs.writeFileSync(SEEN_FILE, JSON.stringify([...set]));
-}
-
-// ─── Subscription management ──────────────────────────────────────────────────
-
-let _autoBuyHandler = null;
+// ─── Subscription management — in-memory, instant ────────────────────────────
 
 export function registerAutoBuyHandler(fn) {
   _autoBuyHandler = fn;
 }
 
 export function subscribeToLaunches(chatId) {
-  const subs = loadSubs();
-  subs[String(chatId)] = true;
-  saveSubs(subs);
+  _subs.set(String(chatId), true);
+  persistSubs(); // async, non-blocking
 }
 
 export function unsubscribeFromLaunches(chatId) {
-  const subs = loadSubs();
-  delete subs[String(chatId)];
-  saveSubs(subs);
+  _subs.delete(String(chatId));
+  persistSubs();
 }
 
 export function isSubscribedToLaunches(chatId) {
-  return !!loadSubs()[String(chatId)];
+  return _subs.has(String(chatId)); // instant — no file read
 }
 
 export function getLaunchSubCount() {
-  return Object.keys(loadSubs()).length;
+  return _subs.size;
 }
 
 // ─── Fetch latest tokens ──────────────────────────────────────────────────────
 
 async function fetchLatestTokens() {
   try {
-    const res = await fetch(`${API}/tokens?limit=500`, {
-      signal: AbortSignal.timeout(10000),
+    const res = await fetch(`${API}/tokens?limit=20&sort=createdAt&order=desc`, {
+      signal: AbortSignal.timeout(3000), // aggressive — skip slow cycles
     });
     if (res.ok) {
       const data = await res.json();
       return data?.tokens ?? [];
     }
   } catch (e) {
-    console.warn(`Launch notifier fetch error: ${e.message}`);
+    // Silent — we'll retry next cycle in 2s
   }
   return [];
 }
 
-// ─── Format launch alert message ─────────────────────────────────────────────
+// ─── Format launch alert ──────────────────────────────────────────────────────
 
 function fmtPrice(n) {
   if (!n) return "$0";
@@ -99,80 +118,84 @@ function fmtNum(n) {
 function buildLaunchMsg(token) {
   const statusEmoji = token.graduated ? "🎓" : "🚀";
   const status      = token.graduated ? "Graduated" : "On Curve (Bonding)";
-
   let msg = `${statusEmoji} <b>New Token Launched!</b>\n\n`;
   msg += `🪙 <b>${token.name}</b> (<code>${token.symbol}</code>)\n`;
   msg += `👤 Creator: <code>${token.creator}</code>\n\n`;
   msg += `💰 Price:  <code>${fmtPrice(token.price)}</code>\n`;
   msg += `📊 MCap:   <code>$${fmtNum(token.mcap)}</code>\n`;
   msg += `🏷 Status: ${status}\n`;
-
   if (token.description) {
     const desc = token.description.trim().slice(0, 120);
     msg += `\n📝 <i>${desc}${token.description.length > 120 ? "…" : ""}</i>\n`;
   }
-
   msg += `\n/token_${token.symbol}   /devcheck_${token.symbol}`;
   return msg;
 }
 
-// ─── Main polling loop ────────────────────────────────────────────────────────
+// ─── Poll loop ────────────────────────────────────────────────────────────────
 
-export function startLaunchNotifier(bot) {
-  console.log("🚀 Launch notifier started.");
+async function poll() {
+  if (_polling) return; // skip if previous cycle still running
+  _polling = true;
 
-  // Seed seen tokens on startup so we don't spam on first run
-  fetchLatestTokens().then(tokens => {
-    const seen = loadSeen();
-    let added = 0;
-    for (const t of tokens) {
-      seen.add(t.tokenId);
-      added++;
+  try {
+    const tokens    = await fetchLatestTokens();
+    const newTokens = tokens.filter(t => t.tokenId && !_seen.has(String(t.tokenId)));
+    if (!newTokens.length) return;
+
+    // Mark seen immediately — before anything else
+    for (const t of newTokens) _seen.add(String(t.tokenId));
+    persistSeen(); // async, won't block
+
+    console.log(`🆕 New tokens: ${newTokens.map(t => t.symbol).join(", ")}`);
+
+    for (const t of newTokens) {
+      // ── STEP 1: Fire auto-buy IMMEDIATELY — highest priority ──────────────
+      if (_autoBuyHandler && _bot) {
+        setImmediate(() =>
+          _autoBuyHandler(_bot, t).catch(e =>
+            console.warn(`autoBuy error for ${t.symbol}:`, e.message)
+          )
+        );
+      }
+
+      // ── STEP 2: Notify subscribers — parallel, fire-and-forget ────────────
+      if (_subs.size > 0 && _bot) {
+        const msg = buildLaunchMsg(t);
+        setImmediate(() => {
+          const sends = [..._subs.keys()].map(chatId =>
+            _bot.api.sendMessage(Number(chatId), msg, { parse_mode: "HTML" })
+              .catch(() => {})
+          );
+          Promise.allSettled(sends).catch(() => {});
+        });
+      }
     }
-    saveSeen(seen);
-    console.log(`Launch notifier seeded with ${added} existing tokens.`);
-  }).catch(console.error);
-
-  // Start polling after 10s delay (let seed finish)
-  setTimeout(() => {
-    setInterval(() => poll(bot).catch(console.error), POLL_MS);
-  }, 10_000);
+  } catch (e) {
+    console.warn("Poll error:", e.message);
+  } finally {
+    _polling = false;
+  }
 }
 
-async function poll(bot) {
-  const subs   = loadSubs();
-  const seen   = loadSeen();
-  const tokens = await fetchLatestTokens();
-  const newTokens = tokens.filter(t => !seen.has(t.tokenId));
+// ─── Start ────────────────────────────────────────────────────────────────────
 
-  if (!newTokens.length) return;
+export function startLaunchNotifier(bot) {
+  _bot = bot;
+  console.log(`🚀 Launch notifier started — polling every ${POLL_MS}ms`);
 
-  // Always mark as seen — even if no subscribers, so we don't backfill later
-  for (const t of newTokens) seen.add(t.tokenId);
-  saveSeen(seen);
-
-  console.log(`🆕 New tokens detected: ${newTokens.map(t => t.symbol).join(", ")}`);
-
-  // No subscribers — nothing to send
-  if (Object.keys(subs).length === 0) {
-    console.log("No subscribers — skipping notifications.");
-    return;
-  }
-
-  // Notify all subscribers
-  for (const t of newTokens) {
-    const msg = buildLaunchMsg(t);
-    console.log(`📣 Notifying ${Object.keys(subs).length} subscribers about ${t.symbol}`);
-    for (const chatId of Object.keys(subs)) {
-      await bot.api.sendMessage(Number(chatId), msg, { parse_mode: "HTML" })
-        .catch(e => console.warn(`Launch notify failed for ${chatId}: ${e.message}`));
-      await new Promise(r => setTimeout(r, 100));
+  // Seed on startup so we don't trigger on existing tokens
+  fetchLatestTokens().then(tokens => {
+    for (const t of tokens) {
+      if (t.tokenId) _seen.add(String(t.tokenId));
     }
-    // Trigger auto-buy for all users who have it enabled
-    if (_autoBuyHandler) {
-      await _autoBuyHandler(bot, t).catch(e =>
-        console.warn(`Auto-buy handler error for ${t.symbol}: ${e.message}`)
-      );
-    }
-  }
+    persistSeen();
+    console.log(`Launch notifier seeded: ${_seen.size} known tokens`);
+
+    // Start polling only AFTER seed completes
+    setInterval(() => poll().catch(console.error), POLL_MS);
+  }).catch(() => {
+    // Seed failed — start polling anyway
+    setInterval(() => poll().catch(console.error), POLL_MS);
+  });
 }

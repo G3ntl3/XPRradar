@@ -8,7 +8,7 @@ import { getMongoCollection } from "./db.js";
 // ─── Open a position after a buy ──────────────────────────────────────────────
 export async function openPosition({
   userId, accountName, symbol, tokenId,
-  tokenName, xprSpent, tokenAmount, entryMcap, autoSellX, autoSellSL,
+  tokenName, xprSpent, tokenAmount, entryMcap, autoSellX, autoSellSL, precision = 4
 }) {
   const col = await getMongoCollection("positions");
   await col.insertOne({
@@ -21,9 +21,10 @@ export async function openPosition({
     tokenAmount,
     entryMcap,
     targetMcap:  entryMcap * autoSellX,
-    stopMcap:    entryMcap * (autoSellSL || 0.2), // Default to 80% if not set
+    stopMcap:    entryMcap * (autoSellSL || 0.6), // Default to -40% if not set
     autoSellX,
-    autoSellSL:  autoSellSL || 0.2,
+    autoSellSL:  autoSellSL || 0.6,
+    precision,
     openedAt:    new Date(),
     status:      "open",
   });
