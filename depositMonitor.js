@@ -57,7 +57,11 @@ async function getRecentTransfers(accountName, lastSeq = 0) {
   }
 }
 
+let _polling = false;
 async function pollDeposits(bot) {
+  if (_polling) return;
+  _polling = true;
+  try {
   let wallets;
   try {
     const col = await getMongoCollection("wallets");
@@ -101,6 +105,9 @@ async function pollDeposits(bot) {
   }
 
   saveSeqs(seqs);
+  } finally {
+    _polling = false;
+  }
 }
 
 export function startDepositMonitor(bot) {
@@ -124,6 +131,12 @@ export function startDepositMonitor(bot) {
       console.log("💰 Deposit monitor seeded.");
     } catch {}
     // Start polling after seed
-    setInterval(() => pollDeposits(bot).catch(console.error), POLL_MS);
+    // Start polling after seed
+    const tick = () => {
+      pollDeposits(bot).catch(console.error).finally(() => {
+        setTimeout(tick, POLL_MS);
+      });
+    };
+    tick();
   }, 5000);
 }

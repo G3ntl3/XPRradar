@@ -18,7 +18,7 @@ async function get(path) {
 // ─── Single token ─────────────────────────────────────────────────────────────
 
 export async function getToken(symbol) {
-  const data = await get(`/tokens?symbol=${symbol.toUpperCase()}`);
+  const data = await get(`/tokens?symbol=${encodeURIComponent(symbol.toUpperCase())}`);
   return data?.tokens?.[0] ?? null;
 }
 
