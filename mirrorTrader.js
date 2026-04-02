@@ -16,6 +16,7 @@ import { saveSnapshot } from "./snapshots.js";
 import { Api, JsonRpc } from "eosjs";
 import { JsSignatureProvider } from "eosjs/dist/eosjs-jssig.js";
 import { getPrivateKey } from "./wallet.js";
+import { getToken } from "./xprApi.js";
 
 const NODES = [
   "https://api.protonnz.com",
@@ -151,17 +152,22 @@ async function executeBuy(userId, m, swap, bot) {
   const result = await buyTokens({ userId, accountName: m.accountName, tokenId: swap.tokenId, xprAmount: m.xprAmount });
   const txId   = result?.transaction_id?.slice(0, 32) ?? "confirmed";
   const symbol = await getSymbol(swap.tokenId);
+  
+  // Fetch real mcap and token details for accurate positions/PNL
+  const tokenInfo = await getToken(symbol);
+  const entryMcap = tokenInfo?.mcap ?? 0;
+  const tokenName = tokenInfo?.name ?? symbol;
 
   // Record position
   try {
     await openPosition({
       userId, accountName: m.accountName,
-      symbol, tokenId: swap.tokenId, tokenName: symbol,
-      xprSpent: m.xprAmount, tokenAmount: 0, entryMcap: 0,
+      symbol, tokenId: swap.tokenId, tokenName,
+      xprSpent: m.xprAmount, tokenAmount: 0, entryMcap,
       autoSellX: 3, autoSellSL: 0.6, precision: 4,
       openedAt: Math.floor(Date.now() / 1000),
     });
-    saveSnapshot(userId, symbol, 0);
+    saveSnapshot(userId, symbol, entryMcap);
   } catch {}
 
   await bot.api.sendMessage(Number(userId),
@@ -252,8 +258,9 @@ async function executeSell(userId, m, swap, bot) {
 
 // ─── Poll loop ────────────────────────────────────────────────────────────────
 
-async function poll(userId, bot, m) {
-  if (!m || !m.isRunning || _mirrors.get(String(userId)) !== m) return;
+async function poll(userId, bot) {
+  const m = _mirrors.get(String(userId));
+  if (!m || !m.isRunning) return;
 
   try {
     const actions = await fetchActions(m.target);
@@ -262,6 +269,17 @@ async function poll(userId, bot, m) {
       const key = actionKey(action);
       if (m.seenKeys.has(key)) continue;
       m.seenKeys.add(key);
+
+      // Strict timestamp check — reject anything older than mirror start time
+      let actionTs = action["@timestamp"] ?? action.timestamp ?? null;
+      if (actionTs) {
+        if (!actionTs.endsWith("Z")) actionTs += "Z";
+        const actionSec = Math.floor(new Date(actionTs).getTime() / 1000);
+        if (actionSec < m.startedAtSec) {
+          // Old action — skip silently
+          continue;
+        }
+      }
 
       const swap = parseAction(action, m.target);
       if (!swap) continue;
@@ -298,8 +316,27 @@ async function poll(userId, bot, m) {
     console.warn(`Mirror poll error:`, e.message);
   }
 
-  if (m.isRunning && _mirrors.get(String(userId)) === m) {
-    m.timeoutId = setTimeout(() => poll(userId, bot, m).catch(console.error), POLL_MS);
+  if (m.isRunning) {
+    m.timeoutId = setTimeout(() => poll(userId, bot).catch(console.error), POLL_MS);
+  }
+}
+
+// ─── Pre-warm token cache ─────────────────────────────────────────────────────
+
+async function warmTokenCache() {
+  try {
+    const res  = await fetch("https://indexer.protonnz.com/api/tokens?limit=500", {
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await res.json();
+    let count = 0;
+    for (const t of data?.tokens ?? []) {
+      _tokenCache.set(String(t.tokenId), t.symbol);
+      count++;
+    }
+    console.log(`🪞 Token cache warmed: ${count} tokens`);
+  } catch (e) {
+    console.warn(`🪞 Token cache warm failed: ${e.message}`);
   }
 }
 
@@ -309,24 +346,29 @@ export async function startMirror(userId, target, xprAmount, accountName, bot) {
   // Always stop existing first — prevents double instances
   stopMirror(userId);
 
+  // Pre-warm token cache so symbols show correctly from first trade
+  await warmTokenCache();
+
+  // Record start timestamp — ONLY actions after this point will be executed
+  // This is the reliable way to ignore history regardless of seed fetch success
+  const startedAt    = Date.now();
+  const startedAtSec = Math.floor(startedAt / 1000);
+
+  console.log(`🪞 Mirror seeded 0 existing txIds for ${target} — history will be ignored`);
+  console.log(`🪞 Mirror LIVE: ${accountName} → ${target} | only NEW txIds will trigger trades`);
+  console.log(`🪞 Cutoff timestamp: ${new Date(startedAt).toISOString()} (actions before this are ignored)`);
+
   const state = {
     target, xprAmount, accountName,
-    isRunning: true,
-    seenKeys:  new Set(),
-    startedAt: Date.now(),
-    timeoutId: null,
+    isRunning:     true,
+    seenKeys:      new Set(),
+    startedAt,
+    startedAtSec,  // unix seconds — actions with older timestamps are ignored
+    timeoutId:     null,
   };
 
-  // Seed to avoid replaying old trades
-  try {
-    const actions = await fetchActions(target);
-    for (const a of actions) state.seenKeys.add(actionKey(a));
-    console.log(`🪞 Mirror seeded ${state.seenKeys.size} keys for ${target}`);
-  } catch {}
-
   _mirrors.set(String(userId), state);
-  state.timeoutId = setTimeout(() => poll(userId, bot, state).catch(console.error), POLL_MS);
-  console.log(`🪞 Mirror started: ${accountName} following ${target}`);
+  state.timeoutId = setTimeout(() => poll(userId, bot).catch(console.error), POLL_MS);
 }
 
 export function stopMirror(userId) {
@@ -335,6 +377,7 @@ export function stopMirror(userId) {
   m.isRunning = false;
   if (m.timeoutId) clearTimeout(m.timeoutId);
   _mirrors.delete(String(userId));
+  console.log(`🪞 Mirror stopped for userId=${userId}`);
   return true;
 }
 

@@ -198,7 +198,22 @@ async function executeSell(bot, pos, token, currentMcap, xMultiple, isStopLoss =
       precision,
     });
 
-    const xprReceived = pos.xprSpent > 0 ? pos.xprSpent * xMultiple : 0;
+    let xprReceivedFromTx = 0;
+    try {
+      const traces = txResult?.processed?.action_traces || [];
+      for (const trace of traces) {
+        for (const inline of (trace.inline_traces || [])) {
+          if (inline.act?.account === "eosio.token" && inline.act?.name === "transfer") {
+            const data = inline.act.data;
+            if (data?.to === pos.accountName && data?.quantity?.includes("XPR")) {
+              xprReceivedFromTx += parseFloat(data.quantity.split(" ")[0]);
+            }
+          }
+        }
+      }
+    } catch (e) {}
+
+    const xprReceived = xprReceivedFromTx > 0 ? xprReceivedFromTx : (pos.xprSpent > 0 ? pos.xprSpent * xMultiple : 0);
     const txId        = txResult?.transaction_id?.slice(0, 16) ?? "confirmed";
     const closed      = await closePosition({ userId: pos.userId, symbol: pos.symbol, xprReceived });
 

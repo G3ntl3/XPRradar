@@ -7,7 +7,7 @@ import { generatePnlCard } from "./pnlCard.js";
 import { startLaunchNotifier, subscribeToLaunches, unsubscribeFromLaunches, isSubscribedToLaunches, registerAutoBuyHandler } from "./launchNotifier.js";
 import { importWallet, getWallet, updateWalletSettings, removeWallet, isValidPrivateKey, findAccountByKey } from "./wallet.js";
 import { buyTokens, sellTokens, getXprBalance, getTokenBalance, getBondingBalance } from "./trader.js";
-import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition } from "./positions.js";
+import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition, getPositions } from "./positions.js";
 import { startPositionMonitor, autoBuyNewToken } from "./autoTrader.js";
 import { startMirror, stopMirror, accountExistsOnChain,getMirror } from "./mirrorTrader.js";
 import { startDepositMonitor } from "./depositMonitor.js";
@@ -1273,8 +1273,10 @@ bot.command("sell", async (ctx) => {
   const token = await getToken(symbol);
   if (!token) return ctx.reply(`❌ Token ${symbol} not found.`);
 
-  // Get position if exists (for PNL tracking) — not required to sell
-  const position = await getPosition(ctx.from.id, symbol);
+  // Get all positions if they exist (for PNL tracking) — not required to sell
+  const openPositions = await getPositions(ctx.from.id, symbol);
+  let totalXprSpent = openPositions.reduce((sum, p) => sum + (p.xprSpent || 0), 0);
+  let avgEntryMcap = openPositions.length > 0 ? openPositions.reduce((sum, p) => sum + (p.entryMcap || 0), 0) / openPositions.length : 0;
 
   const loading = await ctx.reply(`⏳ Checking balance and selling ${symbol}…`);
 
@@ -1293,7 +1295,10 @@ bot.command("sell", async (ctx) => {
       return;
     }
 
-    await sellTokens({
+    // ★ Snapshot XPR balance BEFORE sell — to compute actual received
+    const xprBefore = await getXprBalance(wallet.accountName);
+
+    const txResult = await sellTokens({
       userId:      ctx.from.id,
       accountName: wallet.accountName,
       tokenId:     token.tokenId,
@@ -1302,21 +1307,76 @@ bot.command("sell", async (ctx) => {
       precision:   4,
     });
 
-    const currentMcap  = token.mcap ?? 0;
-    const xprSpent     = position?.xprSpent ?? 0;
-    const xMultiple    = position?.entryMcap > 0 ? currentMcap / position.entryMcap : 1;
-    const xprReceived  = xprSpent > 0 ? xprSpent * xMultiple : 0;
+    // Extract exact XPR received from inline traces (instant and 100% accurate)
+    let xprReceivedFromTx = 0;
+    try {
+      const traces = txResult?.processed?.action_traces || [];
+      for (const trace of traces) {
+        for (const inline of (trace.inline_traces || [])) {
+          if (inline.act?.account === "eosio.token" && inline.act?.name === "transfer") {
+            const data = inline.act.data;
+            if (data?.to === wallet.accountName && data?.quantity?.includes("XPR")) {
+              xprReceivedFromTx += parseFloat(data.quantity.split(" ")[0]);
+            }
+          }
+        }
+      }
+    } catch (e) {}
 
-    if (position) {
+    const xprAfter    = await getXprBalance(wallet.accountName);
+    const diffReceived = Math.max(0, xprAfter - xprBefore);
+    const xprReceived = xprReceivedFromTx > 0 ? xprReceivedFromTx : diffReceived;
+    
+    let xMultiple = 1;
+    let fallbackPositions = [];
+    
+    // Check fallback positions by tokenId if no symbol matches were found
+    if (openPositions.length === 0) {
+      try {
+        const { getMongoCollection } = await import("./db.js");
+        const col = await getMongoCollection("positions");
+        fallbackPositions = await col.find({ userId: String(ctx.from.id), tokenId: token.tokenId, status: "open" }).toArray();
+        if (fallbackPositions.length > 0) {
+          totalXprSpent = fallbackPositions.reduce((sum, p) => sum + (p.xprSpent || 0), 0);
+          avgEntryMcap = fallbackPositions.reduce((sum, p) => sum + (p.entryMcap || 0), 0) / fallbackPositions.length;
+        }
+      } catch (e) {}
+    }
+
+    xMultiple = totalXprSpent > 0 && xprReceived > 0 
+      ? xprReceived / totalXprSpent 
+      : (avgEntryMcap > 0 ? (token.mcap ?? 0) / avgEntryMcap : 1);
+
+    // ★ Close position — try by symbol first, then by tokenId (handles mirror positions stored as #339)
+    if (openPositions.length > 0) {
       await closePosition({ userId: ctx.from.id, symbol, xprReceived });
+    } else if (fallbackPositions.length > 0) {
+      // Try closing by tokenId in case positions were stored under a different symbol (e.g. #339)
+      try {
+        const { getMongoCollection } = await import("./db.js");
+        const col = await getMongoCollection("positions");
+        
+        for (const posByToken of fallbackPositions) {
+          const allocated = totalXprSpent > 0 ? ((posByToken.xprSpent || 0) / totalXprSpent) * xprReceived : xprReceived / fallbackPositions.length;
+          const pnlXpr = allocated - (posByToken.xprSpent || 0);
+          const pnlPct = (posByToken.xprSpent || 0) > 0 ? (pnlXpr / posByToken.xprSpent) * 100 : 0;
+          
+          await col.updateOne(
+            { _id: posByToken._id },
+            { $set: { status: "closed", xprReceived: allocated, pnlXpr, pnlPct, xMulti: xMultiple, closedAt: new Date() } }
+          );
+        }
+      } catch (dbErr) {
+        console.warn("closePosition by tokenId failed:", dbErr.message);
+      }
     }
 
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
       `✅ <b>Sold ${symbol}!</b>\n\n` +
       `🪙 Amount sold: <code>${fmtNum(liveBalance)} ${symbol}</code>\n` +
       `📈 Multiple:    <code>${xMultiple.toFixed(2)}x</code>\n` +
-      (xprSpent > 0 ? `💰 Spent:       <code>${xprSpent.toFixed(4)} XPR</code>\n` : "") +
-      (xprReceived > 0 ? `💵 Received:    <code>~${xprReceived.toFixed(4)} XPR</code>\n` : "") +
+      (totalXprSpent > 0 ? `💰 Spent:       <code>${totalXprSpent.toFixed(4)} XPR</code>\n` : "") +
+      `💵 Received:    <code>${xprReceived.toFixed(4)} XPR</code>\n` +
       `\n<i>Check your XPR balance with /balance</i>`,
       { parse_mode: "HTML" }
     );

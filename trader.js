@@ -289,7 +289,7 @@ export async function buyTokens({ userId, accountName, tokenId, xprAmount }) {
 // ─── SELL ─────────────────────────────────────────────────────────────────────
 
 export async function sellTokens({ userId, accountName, tokenId, tokenAmount, symbol, precision = null }) {
-  const privateKey     = await getPrivateKey(userId);
+  const privateKey = await getPrivateKey(userId);
   if (!privateKey) throw new Error("No wallet found for user");
 
   const actualPrecision = precision ?? await getTokenPrecision(symbol).catch(() => 4);
@@ -309,20 +309,60 @@ export async function sellTokens({ userId, accountName, tokenId, tokenAmount, sy
   const rawAmount = rawTokenAmount(amount, actualPrecision);
   console.log(`sellTokens: ${amount} ${symbol ?? ""} (raw: ${rawAmount}) tokenId=${tokenId}`);
 
-  const api = await getWorkingApi(privateKey);
-  try {
-    return await api.transact({
-      actions: [{
-        account:       CONTRACT,
-        name:          "sell",
-        authorization: [{ actor: accountName, permission: "active" }],
-        data: { seller: accountName, tokenId, tokenAmount: rawAmount, minXpr: 0 },
-      }],
-    }, { blocksBehind: 3, expireSeconds: 30 });
-  } catch (e) {
-    console.error("sellTokens error:", JSON.stringify(e?.json ?? e?.message ?? e));
-    throw new Error(extractEosError(e));
+  // ★ fetch wrapper with hard 15s timeout — prevents api.transact() from hanging forever
+  function fetchWithTimeout(url, opts = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    return fetch(url, { ...opts, signal: controller.signal }).finally(() => clearTimeout(timer));
   }
+
+  // ★ Try each RPC node in order — move to next if transact hangs or fails
+  const sig = new JsSignatureProvider([privateKey]);
+  let lastError;
+
+  for (let i = 0; i < RPC_ENDPOINTS.length; i++) {
+    const base = RPC_ENDPOINTS[(i + _bestRpcIndex) % RPC_ENDPOINTS.length];
+    try {
+      const rpc = new JsonRpc(base, { fetch: fetchWithTimeout });
+      const api = new Api({
+        rpc,
+        signatureProvider: sig,
+        textEncoder: new TextEncoder(),
+        textDecoder: new TextDecoder(),
+      });
+
+      // Race transact against a 20s hard timeout
+      const result = await Promise.race([
+        api.transact({
+          actions: [{
+            account:       CONTRACT,
+            name:          "sell",
+            authorization: [{ actor: accountName, permission: "active" }],
+            data: { seller: accountName, tokenId, tokenAmount: rawAmount, minXpr: 0 },
+          }],
+        }, { blocksBehind: 3, expireSeconds: 60 }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`RPC ${base} timed out after 20s`)), 20_000)
+        ),
+      ]);
+
+      console.log(`sellTokens: success via ${base}`);
+      return result;
+
+    } catch (e) {
+      const msg = e?.message ?? String(e);
+      // Don't retry on on-chain assertion errors — those are final
+      if (msg.includes("assertion failure") || msg.includes("Insufficient")) {
+        console.error("sellTokens chain error:", msg);
+        throw new Error(extractEosError(e));
+      }
+      console.warn(`sellTokens: ${base} failed — ${msg} — trying next node`);
+      lastError = e;
+    }
+  }
+
+  console.error("sellTokens: all nodes failed:", lastError?.message);
+  throw new Error(extractEosError(lastError) ?? "All RPC nodes failed for sell");
 }
 
 // ─── Account creation ─────────────────────────────────────────────────────────

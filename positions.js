@@ -50,26 +50,37 @@ export async function updatePositionSL(userId, symbol, autoSellSL) {
 
 export async function closePosition({ userId, symbol, xprReceived }) {
   const col = await getMongoCollection("positions");
-  const pos = await col.findOne({ userId: String(userId), symbol, status: "open" });
-  if (!pos) return null;
+  const positions = await col.find({ userId: String(userId), symbol, status: "open" }).toArray();
+  if (!positions.length) return null;
 
-  const pnlXpr  = xprReceived - pos.xprSpent;
-  const pnlPct  = ((xprReceived - pos.xprSpent) / pos.xprSpent) * 100;
-  const xMulti  = xprReceived / pos.xprSpent;
+  const totalSpent = positions.reduce((sum, p) => sum + (p.xprSpent || 0), 0);
+  const xMulti = totalSpent > 0 ? xprReceived / totalSpent : 0;
 
-  await col.updateOne(
-    { _id: pos._id },
-    { $set: {
-      status:      "closed",
-      xprReceived,
-      pnlXpr,
-      pnlPct,
-      xMulti,
-      closedAt:    new Date(),
-    }}
-  );
+  for (const pos of positions) {
+    const allocatedReceived = totalSpent > 0 ? ((pos.xprSpent || 0) / totalSpent) * xprReceived : xprReceived / positions.length;
+    const pnlXpr = allocatedReceived - (pos.xprSpent || 0);
+    const pnlPct = pos.xprSpent ? (pnlXpr / pos.xprSpent) * 100 : 0;
 
-  return { ...pos, xprReceived, pnlXpr, pnlPct, xMulti };
+    await col.updateOne(
+      { _id: pos._id },
+      { $set: {
+        status:      "closed",
+        xprReceived: allocatedReceived,
+        pnlXpr,
+        pnlPct,
+        xMulti,
+        closedAt:    new Date(),
+      }}
+    );
+  }
+
+  return {
+    ...positions[0],
+    xprSpent: totalSpent,
+    xprReceived,
+    pnlXpr: xprReceived - totalSpent,
+    xMulti
+  };
 }
 
 // ─── Get all open positions ───────────────────────────────────────────────────
@@ -99,4 +110,9 @@ export async function getTradeHistory(userId, limit = 10) {
 export async function getPosition(userId, symbol) {
   const col = await getMongoCollection("positions");
   return col.findOne({ userId: String(userId), symbol, status: "open" });
+}
+
+export async function getPositions(userId, symbol) {
+  const col = await getMongoCollection("positions");
+  return col.find({ userId: String(userId), symbol, status: "open" }).toArray();
 }

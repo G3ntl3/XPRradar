@@ -111,13 +111,25 @@ function fmtNum(n) {
   return n.toFixed(2);
 }
 
+function fmtDateTime(ts) {
+  if (!ts) return "—";
+  try {
+    const d = typeof ts === "string" ? new Date(ts) : new Date(ts * 1000);
+    if (isNaN(d.getTime())) return "—";
+    return d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  } catch { return "—"; }
+}
+
 function buildLaunchMsg(token) {
   const statusEmoji = token.graduated ? "🎓" : "🚀";
   const status      = token.graduated ? "Graduated" : "On Curve (Bonding)";
+  
+  const launchTime = token.createdAt || token.firstTradeAt || (Date.now() / 1000);
 
   let msg = `${statusEmoji} <b>New Token Launched!</b>\n\n`;
   msg += `🪙 <b>${token.name}</b> (<code>${token.symbol}</code>)\n`;
-  msg += `👤 Creator: <code>${token.creator}</code>\n\n`;
+  msg += `👤 Creator:  <code>${token.creator}</code>\n`;
+  msg += `📅 Launched: <code>${fmtDateTime(launchTime)}</code>\n\n`;
   msg += `💰 Price:  <code>${fmtPrice(token.price)}</code>\n`;
   msg += `📊 MCap:   <code>$${fmtNum(token.mcap)}</code>\n`;
   msg += `🏷 Status: ${status}\n`;
