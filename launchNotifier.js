@@ -16,7 +16,7 @@ import fs    from "fs";
 const API       = "https://indexer.protonnz.com/api";
 const SUBS_FILE = "./launch_subs.json";
 const SEEN_FILE = "./seen_tokens.json";
-const POLL_MS   = 2_000; // was 30_000
+const POLL_MS   = 10_000; // changed to 10s to avoid rate limits
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
@@ -83,7 +83,7 @@ export function getLaunchSubCount() {
 async function fetchLatestTokens() {
   try {
     const res = await fetch(`${API}/tokens?limit=500`, {
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(10000),
     });
     if (res.ok) {
       const data = await res.json();

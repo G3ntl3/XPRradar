@@ -268,10 +268,10 @@ bot.on("message:text", async (ctx, next) => {
       ctx.match = symbol;
       return ctx.reply(`⏳ Fetching <b>${symbol}</b>…`, { parse_mode: "HTML" }).then(async loading => {
         const result = await buildTokenMsg(symbol);
-        if (!result) return ctx.api.editMessageText(ctx.chat.id, loading.message_id, `❌ ${symbol} not found.`);
+        if (!result) return ctx.api.editMessageText(ctx.chat.id, loading.message_id, `❌ ${symbol} not found.`).catch(()=>{});
         saveSnapshot(ctx.from.id, symbol, result.token.mcap ?? result.token.price);
-        await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, { parse_mode: "HTML", reply_markup: result.kb });
-      });
+        await ctx.api.editMessageText(ctx.chat.id, loading.message_id, result.msg, { parse_mode: "HTML", reply_markup: result.kb }).catch(()=>{});
+      }).catch(e => console.error("token_ fallback err", e));
     }
   }
   if (text.startsWith("/devcheck_")) {
@@ -318,7 +318,7 @@ bot.command("token", async (ctx) => {
     console.error(e);
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
       `❌ Error fetching data. Please try again.`
-    );
+    ).catch(() => {});
   }
 });
 
