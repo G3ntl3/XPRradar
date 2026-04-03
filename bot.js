@@ -1480,3 +1480,11 @@ registerAutoBuyHandler(autoBuyNewToken);
 startPositionMonitor(bot);
 startDepositMonitor(bot);
 bot.start();
+console.log("---------------------------------------");
+console.log("🚀 DOCKER CONTAINER HAS STARTED!");
+console.log("Checking environment variables...");
+console.log("Private Key exists:", !!process.env.PRIVATE_KEY);
+console.log("Telegram Token exists:", !!process.env.TELEGRAM_TOKEN);
+console.log("---------------------------------------");
+
+// Then your existing code...
