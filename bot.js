@@ -1467,8 +1467,8 @@ bot.command("mirror", async (ctx) => {
 
 bot.command("mirror_off", async (ctx) => {
   const stopped = stopMirror(ctx.from.id);
-  if (!stopped) return ctx.reply("❌ No active mirror session.");
-  await ctx.reply(`🛑 <b>Mirror stopped.</b>\n\nUse /mirror to start again.`, { parse_mode: "HTML" });
+  if (!stopped) return ctx.reply("Mirror turned off.");
+  await ctx.reply(`Mirror turned off.\n\nUse /mirror to start again.`, { parse_mode: "HTML" });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
