@@ -9,7 +9,7 @@ import { importWallet, getWallet, updateWalletSettings, removeWallet, isValidPri
 import { buyTokens, sellTokens, getXprBalance, getTokenBalance, getBondingBalance } from "./trader.js";
 import { openPosition, closePosition, getOpenPositions, getTradeHistory, getPosition, getPositions } from "./positions.js";
 import { startPositionMonitor, autoBuyNewToken } from "./autoTrader.js";
-import { startMirror, stopMirror, accountExistsOnChain,getMirror } from "./mirrorTrader.js";
+import { startMirror, stopMirror, accountExistsOnChain, getMirror, getMirrors } from "./mirrorTrader.js";
 import { startDepositMonitor } from "./depositMonitor.js";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN in .env");
@@ -1397,32 +1397,33 @@ bot.command("mirror", async (ctx) => {
   const target    = parts?.[0]?.toLowerCase();
   const xprAmount = parseFloat(parts?.[1]) || wallet.autoBuyXpr || 5;
 
-  // Show status if no args
+  // ── No args: show all active sessions ────────────────────────────────────
   if (!target) {
-    const session = getMirror(ctx.from.id);
-    if (session) {
-      const elapsed = Math.floor((Date.now() - session.startedAt) / 1000);
-      const mins    = Math.floor(elapsed / 60);
-      const secs    = elapsed % 60;
-      return ctx.reply(
-        `🪞 <b>Mirror Active</b>\n\n` +
-        `👤 Target:  <code>${session.target}</code>\n` +
-        `💰 Buy amt: <code>${session.xprAmount} XPR</code>\n` +
-        `⏱ Running: <code>${mins}m ${secs}s</code>\n\n` +
-        `Use /mirror_off to stop.`,
-        { parse_mode: "HTML" }
-      );
+    const sessions = getMirrors(ctx.from.id);
+    if (sessions.length > 0) {
+      let msg = `🪞 <b>Active Mirror Sessions (${sessions.length})</b>\n\n`;
+      for (const s of sessions) {
+        const elapsed = Math.floor((Date.now() - s.startedAt) / 1000);
+        const mins    = Math.floor(elapsed / 60);
+        const secs    = elapsed % 60;
+        msg += `👤 <code>${s.target}</code>\n`;
+        msg += `   💰 ${s.xprAmount} XPR/trade  ⏱ ${mins}m ${secs}s\n\n`;
+      }
+      msg += `Use /mirror_off &lt;account&gt; to stop one.\n`;
+      msg += `Use /mirror_off all to stop all.`;
+      return ctx.reply(msg, { parse_mode: "HTML" });
     }
     return ctx.reply(
       `🪞 <b>Mirror Trading</b>\n\n` +
       `Copy every SimpleDEX trade of a target wallet.\n\n` +
       `<b>Usage:</b>\n` +
       `<code>/mirror &lt;account&gt; &lt;xpr_amount&gt;</code>\n\n` +
-      `<b>Example:</b>\n` +
-      `<code>/mirror toptrader 5</code>\n` +
-      `→ Buys 5 XPR of every token the target buys on SimpleDEX\n` +
-      `→ Sells your full position when target sells\n\n` +
-      `Use /mirror_off to stop.`,
+      `<b>Examples:</b>\n` +
+      `<code>/mirror toptrader 5</code> — mirror one wallet\n` +
+      `<code>/mirror alpha 5</code> then <code>/mirror beta 3</code> — mirror two at once!\n\n` +
+      `→ Buys XPR of every token the target buys\n` +
+      `→ Sells your position when target sells\n\n` +
+      `Use /mirror_off &lt;account&gt; to stop one, or /mirror_off all to stop all.`,
       { parse_mode: "HTML" }
     );
   }
@@ -1437,7 +1438,6 @@ bot.command("mirror", async (ctx) => {
 
   const loading = await ctx.reply(`⏳ Verifying <code>${target}</code> and starting mirror…`, { parse_mode: "HTML" });
 
-  // Verify target account exists on-chain
   const exists = await accountExistsOnChain(target);
   if (!exists) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
@@ -1449,15 +1449,22 @@ bot.command("mirror", async (ctx) => {
 
   try {
     await startMirror(ctx.from.id, target, xprAmount, wallet.accountName, bot);
-    await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
-      `🪞 <b>Mirror Active!</b>\n\n` +
-      `👤 Target:   <code>${target}</code>\n` +
-      `💰 Buy amt:  <code>${xprAmount} XPR</code> per trade\n` +
-      `📬 Account:  <code>${wallet.accountName}</code>\n\n` +
-      `Every SimpleDEX buy/sell by <code>${target}</code> will be copied.\n` +
-      `Use /mirror_off to stop.`,
-      { parse_mode: "HTML" }
-    );
+
+    // Show all currently active sessions after adding this new one
+    const sessions = getMirrors(ctx.from.id);
+    let msg = `🪞 <b>Mirror Active!</b>\n\n`;
+    msg += `✅ Now mirroring <code>${target}</code> @ <code>${xprAmount} XPR</code>/trade\n\n`;
+    if (sessions.length > 1) {
+      msg += `<b>All active targets (${sessions.length}):</b>\n`;
+      for (const s of sessions) msg += `   • <code>${s.target}</code> — ${s.xprAmount} XPR/trade\n`;
+      msg += `\n`;
+    }
+    msg += `📬 Wallet: <code>${wallet.accountName}</code>\n\n`;
+    msg += `To add more: <code>/mirror &lt;account&gt; &lt;amount&gt;</code>\n`;
+    msg += `To stop one: <code>/mirror_off ${target}</code>\n`;
+    msg += `To stop all: <code>/mirror_off all</code>`;
+
+    await ctx.api.editMessageText(ctx.chat.id, loading.message_id, msg, { parse_mode: "HTML" });
   } catch (e) {
     await ctx.api.editMessageText(ctx.chat.id, loading.message_id,
       `❌ Mirror failed: ${e.message}`
@@ -1465,10 +1472,38 @@ bot.command("mirror", async (ctx) => {
   }
 });
 
+// ─── /mirror_off ──────────────────────────────────────────────────────────────
+// /mirror_off            — stop ALL active mirrors
+// /mirror_off all        — stop ALL active mirrors
+// /mirror_off <account>  — stop one specific mirror
+
 bot.command("mirror_off", async (ctx) => {
-  const stopped = stopMirror(ctx.from.id);
-  if (!stopped) return ctx.reply("Mirror turned off.");
-  await ctx.reply(`Mirror turned off.\n\nUse /mirror to start again.`, { parse_mode: "HTML" });
+  const arg = ctx.match?.trim().toLowerCase();
+
+  if (!arg || arg === "all") {
+    const stopped = stopMirror(ctx.from.id);
+    if (!stopped) return ctx.reply("⚠️ No active mirrors to stop.");
+    return ctx.reply(`🛑 <b>All mirrors stopped.</b>\n\nUse /mirror to start again.`, { parse_mode: "HTML" });
+  }
+
+  // Stop a specific target
+  const stopped = stopMirror(ctx.from.id, arg);
+  if (!stopped) {
+    return ctx.reply(
+      `⚠️ No active mirror for <code>${arg}</code>.\n\nUse /mirror to see active sessions.`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const remaining = getMirrors(ctx.from.id);
+  let msg = `🛑 <b>Mirror stopped</b> for <code>${arg}</code>.\n\n`;
+  if (remaining.length > 0) {
+    msg += `<b>Still mirroring (${remaining.length}):</b>\n`;
+    for (const s of remaining) msg += `   • <code>${s.target}</code> — ${s.xprAmount} XPR/trade\n`;
+  } else {
+    msg += `No active mirrors remaining.`;
+  }
+  await ctx.reply(msg, { parse_mode: "HTML" });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

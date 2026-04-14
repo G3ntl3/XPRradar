@@ -1,12 +1,18 @@
 /**
  * Mirror Trader — copy-trade on SimpleDEX
  *
- * Key fixes:
- * 1. Composite dedup key (txId:global_sequence) — prevents same-txId actions being skipped
- * 2. Per-token sell lock — prevents duplicate sells for same token
- * 3. stopMirror called before startMirror — prevents double instances
- * 4. HTML-safe fetch with node fallback
- * 5. Positions + wallet updated on every mirror trade
+ * Multi-target support:
+ * - Each user can mirror multiple wallets simultaneously
+ * - Each (userId, target) pair gets its own independent poll loop,
+ *   dedup key set, and sell lock — they never interfere with each other
+ * - _mirrors: Map<userId, Map<target, session>>
+ * - _sellLock: Map<"userId:target:tokenId", true>
+ *
+ * Other key features:
+ * 1. Composite dedup key (txId:global_sequence) prevents skipping same-txId actions
+ * 2. Per-target per-token sell lock prevents duplicate sells
+ * 3. HTML-safe fetch with node fallback
+ * 4. Positions + wallet updated on every mirror trade
  */
 
 import fetch from "node-fetch";
@@ -28,8 +34,11 @@ const SIMPLEDEX = "simplelaunch";
 const XPR_TOKEN = "eosio.token";
 const POLL_MS   = 1500;
 
+// _mirrors: Map<userId (string), Map<target (string), session>>
 const _mirrors  = new Map();
-const _sellLock = new Map(); // userId:tokenId -> true — prevents duplicate sells
+
+// _sellLock: Map<"userId:target:tokenId", true>
+const _sellLock = new Map();
 
 // ─── Safe fetch ───────────────────────────────────────────────────────────────
 
@@ -85,7 +94,7 @@ async function getSymbol(tokenId) {
   return _tokenCache.get(key) ?? `#${tokenId}`;
 }
 
-// ─── Composite dedup key — handles multiple actions per txId ──────────────────
+// ─── Composite dedup key ──────────────────────────────────────────────────────
 
 function actionKey(action) {
   const txId = action.trx_id ?? action.action_trace?.trx_id ?? "?";
@@ -111,7 +120,6 @@ function parseAction(action, target) {
 
     const { account, name, data } = act;
 
-    // BUY: eosio.token transfer to simplelaunch, memo starts with "buy:"
     if (account === XPR_TOKEN && name === "transfer") {
       if ((data?.from ?? "").toLowerCase() !== target.toLowerCase()) return null;
       if (data?.to !== SIMPLEDEX) return null;
@@ -122,7 +130,6 @@ function parseAction(action, target) {
       return { type: "buy", tokenId, txId };
     }
 
-    // SELL: simplelaunch::sell
     if (account === SIMPLEDEX && name === "sell") {
       const seller  = (data?.seller ?? "").toLowerCase();
       if (seller !== target.toLowerCase()) return null;
@@ -139,31 +146,29 @@ function parseAction(action, target) {
 
 // ─── Execute mirror buy ───────────────────────────────────────────────────────
 
-async function executeBuy(userId, m, swap, bot) {
-  const balance = await getXprBalance(m.accountName);
-  if (balance < m.xprAmount) {
+async function executeBuy(userId, session, swap, bot) {
+  const balance = await getXprBalance(session.accountName);
+  if (balance < session.xprAmount) {
     await bot.api.sendMessage(Number(userId),
-      `⚠️ <b>Mirror buy skipped — low balance</b>\nHave: <code>${balance.toFixed(4)} XPR</code>  Need: <code>${m.xprAmount} XPR</code>`,
+      `⚠️ <b>Mirror buy skipped — low balance</b>\nTarget: <code>${session.target}</code>\nHave: <code>${balance.toFixed(4)} XPR</code>  Need: <code>${session.xprAmount} XPR</code>`,
       { parse_mode: "HTML" }
     ).catch(() => {});
     return;
   }
 
-  const result = await buyTokens({ userId, accountName: m.accountName, tokenId: swap.tokenId, xprAmount: m.xprAmount });
+  const result = await buyTokens({ userId, accountName: session.accountName, tokenId: swap.tokenId, xprAmount: session.xprAmount });
   const txId   = result?.transaction_id?.slice(0, 32) ?? "confirmed";
   const symbol = await getSymbol(swap.tokenId);
   
-  // Fetch real mcap and token details for accurate positions/PNL
   const tokenInfo = await getToken(symbol);
   const entryMcap = tokenInfo?.mcap ?? 0;
   const tokenName = tokenInfo?.name ?? symbol;
 
-  // Record position
   try {
     await openPosition({
-      userId, accountName: m.accountName,
+      userId, accountName: session.accountName,
       symbol, tokenId: swap.tokenId, tokenName,
-      xprSpent: m.xprAmount, tokenAmount: 0, entryMcap,
+      xprSpent: session.xprAmount, tokenAmount: 0, entryMcap,
       autoSellX: 3, autoSellSL: 0.6, precision: 4,
       openedAt: Math.floor(Date.now() / 1000),
     });
@@ -172,21 +177,20 @@ async function executeBuy(userId, m, swap, bot) {
 
   await bot.api.sendMessage(Number(userId),
     `🪞 <b>Mirror Buy!</b>\n\n` +
-    `🎯 Copied: <code>${m.target}</code>\n` +
+    `🎯 Copied: <code>${session.target}</code>\n` +
     `🪙 Token:  <code>${symbol}</code>\n` +
-    `💰 Spent:  <code>${m.xprAmount} XPR</code>\n` +
-    `🔗 TX: <code>${txId}…</code>`,
+    `💰 Spent:  <code>${session.xprAmount} XPR</code>\n` +
+    `🔗 TX: <code>${txId}...</code>`,
     { parse_mode: "HTML" }
   ).catch(() => {});
 }
 
 // ─── Execute mirror sell ──────────────────────────────────────────────────────
 
-async function executeSell(userId, m, swap, bot) {
-  // Per-token sell lock — prevents duplicate sells firing simultaneously
-  const lockKey = `${userId}:${swap.tokenId}`;
+async function executeSell(userId, session, swap, bot) {
+  const lockKey = `${userId}:${session.target}:${swap.tokenId}`;
   if (_sellLock.get(lockKey)) {
-    console.log(`[mirror sell] LOCKED — already selling tokenId=${swap.tokenId}`);
+    console.log(`[mirror sell] LOCKED — tokenId=${swap.tokenId} target=${session.target}`);
     return;
   }
   _sellLock.set(lockKey, true);
@@ -194,22 +198,19 @@ async function executeSell(userId, m, swap, bot) {
   try {
     const symbol = await getSymbol(swap.tokenId);
 
-    // Retry balance fetch up to 4x
     let balance = 0;
     for (let i = 0; i < 4; i++) {
-      balance = await getBondingBalance(m.accountName, swap.tokenId);
+      balance = await getBondingBalance(session.accountName, swap.tokenId);
       if (balance > 0) break;
       await new Promise(r => setTimeout(r, 700));
     }
 
     if (!balance || balance <= 0) {
-      console.log(`[mirror sell] no balance for tokenId=${swap.tokenId} — skipping`);
+      console.log(`[mirror sell] no balance tokenId=${swap.tokenId} target=${session.target} — skipping`);
       return;
     }
 
-    const rawAmount = Math.floor(balance * 10000);
-
-    // Build API
+    const rawAmount  = Math.floor(balance * 10000);
     const privateKey = await getPrivateKey(userId);
     if (!privateKey) throw new Error("No wallet found");
 
@@ -229,14 +230,13 @@ async function executeSell(userId, m, swap, bot) {
       actions: [{
         account:       SIMPLEDEX,
         name:          "sell",
-        authorization: [{ actor: m.accountName, permission: "active" }],
-        data: { seller: m.accountName, tokenId: swap.tokenId, tokenAmount: rawAmount, minXpr: 0 },
+        authorization: [{ actor: session.accountName, permission: "active" }],
+        data: { seller: session.accountName, tokenId: swap.tokenId, tokenAmount: rawAmount, minXpr: 0 },
       }],
     }, { blocksBehind: 3, expireSeconds: 120 });
 
     const txId = result?.transaction_id?.slice(0, 32) ?? "confirmed";
 
-    // Close position
     try {
       const pos = await getPosition(userId, symbol);
       if (pos) await closePosition({ userId, symbol, xprReceived: pos.xprSpent });
@@ -244,80 +244,77 @@ async function executeSell(userId, m, swap, bot) {
 
     await bot.api.sendMessage(Number(userId),
       `🪞 <b>Mirror Sell!</b>\n\n` +
-      `🎯 Copied: <code>${m.target}</code>\n` +
+      `🎯 Copied: <code>${session.target}</code>\n` +
       `🪙 Sold:   <code>${balance.toFixed(4)} ${symbol}</code>\n` +
-      `🔗 TX: <code>${txId}…</code>`,
+      `🔗 TX: <code>${txId}...</code>`,
       { parse_mode: "HTML" }
     ).catch(() => {});
 
   } finally {
-    // Release lock after 10s — prevents re-triggering on same action repoll
     setTimeout(() => _sellLock.delete(lockKey), 10_000);
   }
 }
 
-// ─── Poll loop ────────────────────────────────────────────────────────────────
+// ─── Poll loop (one per userId+target pair) ───────────────────────────────────
 
-async function poll(userId, bot) {
-  const m = _mirrors.get(String(userId));
-  if (!m || !m.isRunning) return;
+async function poll(userId, target, bot) {
+  const userMirrors = _mirrors.get(String(userId));
+  if (!userMirrors) return;
+
+  const session = userMirrors.get(target);
+  if (!session || !session.isRunning) return;
 
   try {
-    const actions = await fetchActions(m.target);
+    const actions = await fetchActions(target);
 
     for (const action of actions) {
       const key = actionKey(action);
-      if (m.seenKeys.has(key)) continue;
-      m.seenKeys.add(key);
+      if (session.seenKeys.has(key)) continue;
+      session.seenKeys.add(key);
 
-      // Strict timestamp check — reject anything older than mirror start time
       let actionTs = action["@timestamp"] ?? action.timestamp ?? null;
       if (actionTs) {
         if (!actionTs.endsWith("Z")) actionTs += "Z";
         const actionSec = Math.floor(new Date(actionTs).getTime() / 1000);
-        if (actionSec < m.startedAtSec) {
-          // Old action — skip silently
-          continue;
-        }
+        if (actionSec < session.startedAtSec) continue;
       }
 
-      const swap = parseAction(action, m.target);
+      const swap = parseAction(action, target);
       if (!swap) continue;
 
-      console.log(`🪞 [${m.target}] ${swap.type} tokenId=${swap.tokenId}`);
+      console.log(`🪞 [${target}] ${swap.type} tokenId=${swap.tokenId} (user=${userId})`);
 
       if (swap.type === "buy") {
-        executeBuy(userId, m, swap, bot).catch(e => {
-          console.error(`Mirror buy error:`, e.message);
+        executeBuy(userId, session, swap, bot).catch(e => {
+          console.error(`Mirror buy error [${target}]:`, e.message);
           bot.api.sendMessage(Number(userId),
-            `⚠️ <b>Mirror buy failed</b>\nToken: <code>${swap.tokenId}</code>\nError: <code>${e.message}</code>`,
+            `⚠️ <b>Mirror buy failed</b>\nTarget: <code>${target}</code>\nToken: <code>${swap.tokenId}</code>\nError: <code>${e.message}</code>`,
             { parse_mode: "HTML" }
           ).catch(() => {});
         });
       }
 
       if (swap.type === "sell") {
-        executeSell(userId, m, swap, bot).catch(e => {
-          console.error(`Mirror sell error:`, e.message);
+        executeSell(userId, session, swap, bot).catch(e => {
+          console.error(`Mirror sell error [${target}]:`, e.message);
           bot.api.sendMessage(Number(userId),
-            `⚠️ <b>Mirror sell failed</b>\nToken: <code>${swap.tokenId}</code>\nError: <code>${e.message}</code>`,
+            `⚠️ <b>Mirror sell failed</b>\nTarget: <code>${target}</code>\nToken: <code>${swap.tokenId}</code>\nError: <code>${e.message}</code>`,
             { parse_mode: "HTML" }
           ).catch(() => {});
         });
       }
     }
 
-    // Trim seenKeys
-    if (m.seenKeys.size > 1000) {
-      const arr = [...m.seenKeys];
-      m.seenKeys = new Set(arr.slice(-500));
+    if (session.seenKeys.size > 1000) {
+      const arr = [...session.seenKeys];
+      session.seenKeys = new Set(arr.slice(-500));
     }
   } catch (e) {
-    console.warn(`Mirror poll error:`, e.message);
+    console.warn(`Mirror poll error [${target}]:`, e.message);
   }
 
-  if (m.isRunning) {
-    m.timeoutId = setTimeout(() => poll(userId, bot).catch(console.error), POLL_MS);
+  if (session.isRunning) {
+    session.timeoutId = setTimeout(() => poll(userId, target, bot).catch(console.error), POLL_MS);
   }
 }
 
@@ -342,45 +339,86 @@ async function warmTokenCache() {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Start mirroring a target wallet for a user.
+ * Multiple calls with DIFFERENT targets run in parallel.
+ * Calling with the SAME target replaces only that session.
+ */
 export async function startMirror(userId, target, xprAmount, accountName, bot) {
-  // Always stop existing first — prevents double instances
-  stopMirror(userId);
+  const uid = String(userId);
+  target = target.toLowerCase();
 
-  // Pre-warm token cache so symbols show correctly from first trade
+  stopMirror(userId, target); // stop this specific target if already running
+
+  if (!_mirrors.has(uid)) _mirrors.set(uid, new Map());
+  const userMirrors = _mirrors.get(uid);
+
   await warmTokenCache();
 
-  // Record start timestamp — ONLY actions after this point will be executed
-  // This is the reliable way to ignore history regardless of seed fetch success
   const startedAt    = Date.now();
   const startedAtSec = Math.floor(startedAt / 1000);
 
-  console.log(`🪞 Mirror seeded 0 existing txIds for ${target} — history will be ignored`);
-  console.log(`🪞 Mirror LIVE: ${accountName} → ${target} | only NEW txIds will trigger trades`);
-  console.log(`🪞 Cutoff timestamp: ${new Date(startedAt).toISOString()} (actions before this are ignored)`);
+  console.log(`🪞 Mirror LIVE: ${accountName} -> ${target} | userId=${uid}`);
+  console.log(`🪞 Cutoff: ${new Date(startedAt).toISOString()} — older actions ignored`);
 
-  const state = {
+  const session = {
     target, xprAmount, accountName,
-    isRunning:     true,
-    seenKeys:      new Set(),
+    isRunning:   true,
+    seenKeys:    new Set(),
     startedAt,
-    startedAtSec,  // unix seconds — actions with older timestamps are ignored
-    timeoutId:     null,
+    startedAtSec,
+    timeoutId:   null,
   };
 
-  _mirrors.set(String(userId), state);
-  state.timeoutId = setTimeout(() => poll(userId, bot).catch(console.error), POLL_MS);
+  userMirrors.set(target, session);
+  session.timeoutId = setTimeout(() => poll(uid, target, bot).catch(console.error), POLL_MS);
 }
 
-export function stopMirror(userId) {
-  const m = _mirrors.get(String(userId));
-  if (!m) return false;
-  m.isRunning = false;
-  if (m.timeoutId) clearTimeout(m.timeoutId);
-  _mirrors.delete(String(userId));
-  console.log(`🪞 Mirror stopped for userId=${userId}`);
-  return true;
+/**
+ * Stop mirroring.
+ * stopMirror(userId, target) — stop one specific target
+ * stopMirror(userId)         — stop ALL targets for this user
+ */
+export function stopMirror(userId, target = null) {
+  const uid = String(userId);
+  const userMirrors = _mirrors.get(uid);
+  if (!userMirrors) return false;
+
+  if (target) {
+    target = target.toLowerCase();
+    const session = userMirrors.get(target);
+    if (!session) return false;
+    session.isRunning = false;
+    if (session.timeoutId) clearTimeout(session.timeoutId);
+    userMirrors.delete(target);
+    if (userMirrors.size === 0) _mirrors.delete(uid);
+    console.log(`🪞 Mirror stopped: userId=${uid} target=${target}`);
+    return true;
+  } else {
+    for (const session of userMirrors.values()) {
+      session.isRunning = false;
+      if (session.timeoutId) clearTimeout(session.timeoutId);
+    }
+    _mirrors.delete(uid);
+    console.log(`🪞 All mirrors stopped for userId=${uid}`);
+    return true;
+  }
 }
 
-export function getMirror(userId)        { return _mirrors.get(String(userId)) ?? null; }
+/** Get all active sessions for a user as an array */
+export function getMirrors(userId) {
+  const userMirrors = _mirrors.get(String(userId));
+  if (!userMirrors) return [];
+  return [...userMirrors.values()];
+}
+
+/** Get one session by target. No target = first session (legacy compat) */
+export function getMirror(userId, target = null) {
+  const userMirrors = _mirrors.get(String(userId));
+  if (!userMirrors) return null;
+  if (target) return userMirrors.get(target.toLowerCase()) ?? null;
+  return userMirrors.values().next().value ?? null;
+}
+
+export function isMirroring(userId)      { return (_mirrors.get(String(userId))?.size ?? 0) > 0; }
 export function getMirrorSession(userId) { return getMirror(userId); }
-export function isMirroring(userId)      { return _mirrors.has(String(userId)); }
