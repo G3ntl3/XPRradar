@@ -147,7 +147,8 @@ bot.command("start", async (ctx) => {
     `/autosell &lt;multiplier&gt; — Auto-sell at target\n` +
     `/positions — Open trades + live PNL\n` +
     `/history — Closed trades\n\n` +
-    `/help — Full command details`,
+    `/help — Full command details\n` +
+    `/guide — Step-by-step navigation guide`,
     { parse_mode: "HTML", disable_web_page_preview: true }
   );
 });
@@ -198,7 +199,39 @@ bot.command("help", async (ctx) => {
     `/buy MARSH 5 — Buy MARSH spending 5 XPR\n` +
     `/sell MARSH — Sell all your MARSH position\n\n` +
 
+    `<b>📖 Guide</b>\n` +
+    `/guide — Step-by-step navigation guide\n\n` +
+
     `<i>Data: indexer.protonnz.com · XPR Network</i>`,
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.command("guide", async (ctx) => {
+  await ctx.reply(
+    `📖 <b>Step-by-step Guide on how to navigate the XprRadar BOT</b>\n\n` +
+    `<b>Step 1 (Funding)</b>\n` +
+    `• Head to your Play Store or Apple Store, download <b>"WebAuth wallet"</b>\n` +
+    `• Sign up\n` +
+    `• Get your Onchain ID\n` +
+    `• Secure your seed phrase ⚠️\n` +
+    `• Head to your CEX, preferably <b>"MEXC exchange"</b>\n` +
+    `• Search for <b>XPR</b> (<i>Note: not XRP</i>)\n` +
+    `• Buy desired amount\n` +
+    `• Head to withdraw on MEXC\n` +
+    `• Head to WebAuth, copy your Onchain ID, and paste it in MEXC (e.g. <code>robert</code>, <code>derek</code>, etc.)\n` +
+    `• Send funds ✅\n` +
+    `• Your XPR will arrive in your wallet shortly\n\n` +
+    `<i>Now you’re successfully Funded</i> 🎉\n\n` +
+    `<b>Step 2 (Linking the BOT to your wallet)</b>\n` +
+    `• Head to your funded WebAuth wallet, copy your private key 🔑\n` +
+    `• Head to the <b>XprRadar BOT</b>\n` +
+    `• Use this command in this sequence:\n` +
+    `  <code>/wallet import &lt;private_key&gt; &lt;your_Onchain_ID&gt;</code>\n` +
+    `• Congratulations, you've successfully linked the BOT to your wallet! ✅\n` +
+    `• Now you can explore and trade at your will 🫡\n\n` +
+    `📞 For questions and support, reach out to our ADMIN @OfficialXtrade1 on TG\n` +
+    `🙂 <i>Trade Responsibly fam</i>`,
     { parse_mode: "HTML" }
   );
 });
