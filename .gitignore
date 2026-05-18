@@ -6,3 +6,7 @@ snapshots.json
 launch_subs.json
 seen_tokens.json
 data/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

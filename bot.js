@@ -209,29 +209,32 @@ bot.command("help", async (ctx) => {
 
 bot.command("guide", async (ctx) => {
   await ctx.reply(
-    `📖 <b>Step-by-step Guide on how to navigate the XprRadar BOT</b>\n\n` +
-    `<b>Step 1 (Funding)</b>\n` +
-    `• Head to your Play Store or Apple Store, download <b>"WebAuth wallet"</b>\n` +
-    `• Sign up\n` +
-    `• Get your Onchain ID\n` +
-    `• Secure your seed phrase ⚠️\n` +
-    `• Head to your CEX, preferably <b>"MEXC exchange"</b>\n` +
-    `• Search for <b>XPR</b> (<i>Note: not XRP</i>)\n` +
-    `• Buy desired amount\n` +
-    `• Head to withdraw on MEXC\n` +
-    `• Head to WebAuth, copy your Onchain ID, and paste it in MEXC (e.g. <code>robert</code>, <code>derek</code>, etc.)\n` +
-    `• Send funds ✅\n` +
-    `• Your XPR will arrive in your wallet shortly\n\n` +
-    `<i>Now you’re successfully Funded</i> 🎉\n\n` +
-    `<b>Step 2 (Linking the BOT to your wallet)</b>\n` +
-    `• Head to your funded WebAuth wallet, copy your private key 🔑\n` +
-    `• Head to the <b>XprRadar BOT</b>\n` +
-    `• Use this command in this sequence:\n` +
+    `📖 <b>Step-by-Step Guide: How to Navigate XprRadar BOT</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `💳 <b>Step 1: Funding Your Wallet</b>\n` +
+    `• 📱 Head to your Play Store or App Store and download the <b>"WebAuth wallet"</b>\n` +
+    `• ✍️ Sign up and create your account\n` +
+    `• 🆔 Find your <b>Onchain ID</b> (your unique username)\n` +
+    `• ⚠️ <b>CRITICAL:</b> Securely back up your seed phrase! Never share it!\n` +
+    `• 🏦 Head to your centralized exchange, preferably <b>"MEXC exchange"</b>\n` +
+    `• 🔍 Search for <b>XPR</b> (<i>Note: not XRP!</i>)\n` +
+    `• 💳 Purchase your desired amount of XPR\n` +
+    `• 📤 Go to Withdraw on MEXC\n` +
+    `• 📋 Open WebAuth, copy your Onchain ID (e.g. <code>robert</code>, <code>derek</code>, etc.), and paste it as the withdrawal recipient in MEXC\n` +
+    `• 📤 Send funds ✅\n` +
+    `• ⌛ Your XPR will arrive in your WebAuth wallet shortly!\n\n` +
+    `🎉 <b>Now you’re successfully Funded!</b> 🎉\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🔗 <b>Step 2: Linking XprRadar to Your Wallet</b>\n` +
+    `• 🔑 Head to your funded WebAuth wallet, copy your <b>private key</b> (WebAuth → Settings → Backup Wallet → Show Private Key)\n` +
+    `• 🤖 Open the <b>XprRadar BOT</b> chat\n` +
+    `• ⚡ Use this command in this sequence:\n` +
     `  <code>/wallet import &lt;private_key&gt; &lt;your_Onchain_ID&gt;</code>\n` +
-    `• Congratulations, you've successfully linked the BOT to your wallet! ✅\n` +
-    `• Now you can explore and trade at your will 🫡\n\n` +
-    `📞 For questions and support, reach out to our ADMIN @OfficialXtrade1 on TG\n` +
-    `🙂 <i>Trade Responsibly fam</i>`,
+    `• 🎉 Congratulations! You've successfully linked the BOT to your wallet! ✅\n` +
+    `• 🚀 Now you can explore, set auto-trades, and trade at your will! 🫡\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `📞 <b>Need Help?</b> For questions and support, reach out to our ADMIN @OfficialXtrade1 on Telegram.\n` +
+    `⚖️ <i>Trade responsibly fam!</i> 🙂`,
     { parse_mode: "HTML" }
   );
 });
